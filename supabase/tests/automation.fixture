@@ -1,0 +1,204 @@
+begin;
+delete from crm_private.settings;
+insert into auth.users(id,email) values('00000000-0000-4000-8000-000000000001','owner@example.invalid'),('00000000-0000-4000-8000-000000000002','other@example.invalid');
+insert into auth.sessions(id,user_id) values('00000000-0000-4000-8000-000000000010','00000000-0000-4000-8000-000000000001'),('00000000-0000-4000-8000-000000000020','00000000-0000-4000-8000-000000000002');
+insert into crm_private.settings(owner_id,mcp_resource) values('00000000-0000-4000-8000-000000000001','https://example.invalid/functions/v1/mcp');
+select set_config('request.jwt.claims','{"sub":"00000000-0000-4000-8000-000000000001","session_id":"00000000-0000-4000-8000-000000000010","role":"authenticated","aud":"authenticated"}',false);
+create or replace function pg_temp.expect(value boolean,label text) returns void language plpgsql as $$ begin if value is distinct from true then raise exception 'FAILED: %',label;end if;end $$;
+do $$ declare cv jsonb;policy jsonb;profile jsonb;configured jsonb;r jsonb;w jsonb;claim_input jsonb;company jsonb;job jsonb;effect jsonb;oldreceipt jsonb;begin
+ insert into public.resumes(user_id,label,country,track,checksum,media_type,storage_path,active) values(auth.uid(),'Synthetic','Mexico','Frontend',repeat('a',64),'application/pdf',auth.uid()::text||'/synthetic.pdf',true) returning to_jsonb(resumes) into cv;
+ profile=jsonb_build_object('id','frontend-MX','country','MX','track','frontend','resume_id',cv->'id','checksum',repeat('a',64),'authorized_country',true,'remote',true,'terms',jsonb_build_array('React'),'exclusions','[]'::jsonb,'allow_unknown_salary',true,'salary_min',null,'currency',null,'salary_period',null);
+ policy=jsonb_build_object('enabled',true,'interval_hours',2,'revalidate_hours',24,'timezone','America/Mexico_City','profiles',jsonb_build_array(profile),'sources',jsonb_build_array('autoapply','openhire','exa'),'model','default','effort','medium','candidates_per_profile',3,'exa_per_run_usd',0.1,'exa_daily_usd',0.1,'exa_monthly_usd',1,'digest_email',false,'closure_email',false);
+ r=public.crm_operation('automation.configure',jsonb_build_object('policy',jsonb_set(policy,'{profiles,0,resume_id}','"00000000-0000-4000-8000-000000000099"'),'expected_version',0,'idempotency_key',gen_random_uuid()));perform pg_temp.expect(r->'error'->>'code'='VALIDATION_ERROR','foreign/nonexistent CV policy denied');
+ configured=public.crm_operation('automation.configure',jsonb_build_object('policy',policy,'expected_version',0,'idempotency_key',gen_random_uuid()));perform pg_temp.expect(configured->>'version'='1','policy activated');
+ r=public.crm_operation('automation.trigger',jsonb_build_object('idempotency_key',gen_random_uuid()));r=public.crm_operation('automation.trigger',jsonb_build_object('idempotency_key',gen_random_uuid()));perform pg_temp.expect((select count(*)=1 from public.automation_work where kind='discovery'),'manual/due coalesces one profile cycle');
+ claim_input=jsonb_build_object('executor_id',gen_random_uuid(),'idempotency_key',gen_random_uuid());r=public.crm_operation('automation.claim',claim_input);w=r->'work';perform pg_temp.expect(w->>'kind'='discovery','claim priority');perform pg_temp.expect(public.crm_operation('automation.claim',claim_input)=r,'claim response replay');
+ r=public.crm_operation('automation.claim',jsonb_build_object('executor_id',gen_random_uuid(),'idempotency_key',gen_random_uuid()));perform pg_temp.expect(r->'work'='null'::jsonb,'second executor cannot claim during live lease');
+ effect=jsonb_build_object('work_id',w->'id','lease_token',w->'lease_token','expected_version',w->'version','idempotency_key',gen_random_uuid(),'operation','companies.upsert','input',jsonb_build_object('name','Synthetic employer','idempotency_key',gen_random_uuid()));r=public.crm_operation('automation.commit',effect);company=r->'result';perform pg_temp.expect(company->>'name'='Synthetic employer','guarded effect');perform pg_temp.expect(public.crm_operation('automation.commit',effect)=r,'ambiguous effect exact replay');
+ r=public.crm_operation('automation.reserve',jsonb_build_object('work_id',w->'id','lease_token',w->'lease_token','expected_version',w->'version','idempotency_key',gen_random_uuid(),'request_id',gen_random_uuid(),'amount_usd',0.1));perform pg_temp.expect(r->>'reserved_usd'='0.1','first reservation');
+ r=public.crm_operation('automation.reserve',jsonb_build_object('work_id',w->'id','lease_token',w->'lease_token','expected_version',w->'version','idempotency_key',gen_random_uuid(),'request_id',gen_random_uuid(),'amount_usd',0.1));perform pg_temp.expect(r->'error'->>'code'='FORBIDDEN','concurrent commitments exhaust budget');
+ effect=jsonb_build_object('work_id',w->'id','lease_token',w->'lease_token','expected_version',w->'version','idempotency_key',gen_random_uuid(),'operation','jobs.upsert','input',jsonb_build_object('company_id',company->'id','title','Synthetic','stage','review','resume_id',cv->'id','idempotency_key',gen_random_uuid()));r=public.crm_operation('automation.commit',effect);job=r->'result';perform pg_temp.expect(job->>'stage'='review','job preparation create');perform pg_temp.expect((select count(*)=0 from crm_private.automation_emails),'email opt-out default');
+ effect=jsonb_build_object('work_id',w->'id','lease_token',w->'lease_token','expected_version',w->'version','idempotency_key',gen_random_uuid(),'operation','outreach.draft','input',jsonb_build_object('job_id',job->'id','resume_id',cv->'id','channel','linkedin','kind','invitation','body','Synthetic invitation','idempotency_key',gen_random_uuid()));r=public.crm_operation('automation.commit',effect);perform pg_temp.expect(r->'result'->>'state'='draft','guarded draft persists');
+ r=public.crm_operation('automation.commit',effect||jsonb_build_object('idempotency_key',gen_random_uuid(),'operation','jobs.upsert','input',jsonb_build_object('id',job->'id','expected_version',1,'stage','applied','applied_at','2026-10-04T00:00:00Z','idempotency_key',gen_random_uuid())));perform pg_temp.expect(r->'error'->>'code'='FORBIDDEN','automation cannot apply');
+ perform public.crm_operation('jobs.transition',jsonb_build_object('id',job->'id','expected_version',1,'stage','applied','applied_at','2026-10-04T00:00:00Z','idempotency_key',gen_random_uuid()));
+ r=public.crm_operation('automation.commit',effect||jsonb_build_object('idempotency_key',gen_random_uuid(),'operation','jobs.transition','input',jsonb_build_object('id',job->'id','expected_version',2,'stage','archived','reason','Posting closed','idempotency_key',gen_random_uuid())));perform pg_temp.expect(r->'error'->>'code'='FORBIDDEN','protect applied/interview process from closure');
+ -- Existing radar backlog is queued even without a CV; overlapping schedule calls coalesce it.
+ insert into public.jobs(user_id,company_id,title,stage) values(auth.uid(),(company->>'id')::uuid,'Existing radar without CV','radar') returning to_jsonb(jobs) into job;
+ perform public.crm_operation('automation.claim',jsonb_build_object('executor_id',gen_random_uuid(),'idempotency_key',gen_random_uuid()));
+ perform public.crm_operation('automation.claim',jsonb_build_object('executor_id',gen_random_uuid(),'idempotency_key',gen_random_uuid()));
+ perform pg_temp.expect((select count(*)=1 from public.automation_work where job_id=(job->>'id')::uuid),'radar backlog queued once');
+ perform pg_temp.expect((select checkpoint->>'needs_profile'='true' from public.automation_work where job_id=(job->>'id')::uuid),'unmapped radar requires actual profile selection');
+ update public.automation_work set state='blocked' where job_id=(job->>'id')::uuid;
+ perform public.crm_operation('automation.claim',jsonb_build_object('executor_id',gen_random_uuid(),'idempotency_key',gen_random_uuid()));
+ perform pg_temp.expect((select count(*)=1 from public.automation_work where job_id=(job->>'id')::uuid and checkpoint->>'contact_only'='true'),'blocked CV triage still queues contact research');
+ update public.automation_work set next_attempt_at=now()+interval '1 day' where checkpoint->>'contact_only'='true';
+ update public.automation_work set lease_until=now()-interval '1 minute' where id=(w->>'id')::uuid;
+ r=public.crm_operation('automation.commit',effect||jsonb_build_object('idempotency_key',gen_random_uuid()));perform pg_temp.expect(r->'error'->>'code'='FORBIDDEN','expired lease denies new effects');
+ r=public.crm_operation('automation.claim',jsonb_build_object('executor_id',gen_random_uuid(),'idempotency_key',gen_random_uuid()));perform pg_temp.expect(r->'work'->>'id'=w->>'id' and r->'work'->>'lease_token'<>w->>'lease_token','restart recovers identity with fenced lease');
+ -- Separate business opt-ins and bounded, stable delivery lease; no sensitive default payload.
+ update public.automation_policies set policy=jsonb_set(automation_policies.policy,'{digest_email}','true'),next_digest_at=now()-interval '1 minute' where user_id=auth.uid();
+ update public.automation_events set created_at=date_trunc('day',now() at time zone 'America/Mexico_City') at time zone 'America/Mexico_City'-interval '1 hour';
+ r=crm_private.automation_email_claim();perform pg_temp.expect(r->>'kind'='digest' and r->>'recipient'='owner@example.invalid','digest owner only');
+ perform pg_temp.expect(crm_private.automation_email_authorize((r->>'id')::uuid,(r->>'lease_token')::uuid),'delivery consent rechecked');
+ perform crm_private.automation_email_finish((r->>'id')::uuid,(r->>'lease_token')::uuid,0,null);
+ update crm_private.automation_emails set next_attempt_at=now() where id=(r->>'id')::uuid;
+ oldreceipt=r;r=crm_private.automation_email_claim();perform pg_temp.expect(r->>'id'=oldreceipt->>'id' and r->>'lease_token'<>oldreceipt->>'lease_token','ambiguous delivery retains provider idempotency identity');
+ update public.automation_policies set policy=jsonb_set(automation_policies.policy,'{digest_email}','false') where user_id=auth.uid();
+ perform pg_temp.expect(not crm_private.automation_email_authorize((r->>'id')::uuid,(r->>'lease_token')::uuid),'late opt-out denies sending');
+ perform crm_private.automation_email_finish((r->>'id')::uuid,(r->>'lease_token')::uuid,-1,null);
+ perform pg_temp.expect((select state='cancelled' from crm_private.automation_emails where id=(r->>'id')::uuid),'opt-out delivery cancelled');
+ policy=jsonb_set(policy,'{enabled}','false');r=public.crm_operation('automation.configure',jsonb_build_object('policy',policy,'expected_version',1,'idempotency_key',gen_random_uuid()));perform pg_temp.expect(r->>'version'='2','pause guard');
+ perform pg_temp.expect(public.crm_operation('automation.status','{}')->>'executor_stale'='true','server detects absent heartbeat');
+ perform set_config('request.jwt.claims','{"sub":"00000000-0000-4000-8000-000000000002","session_id":"00000000-0000-4000-8000-000000000020","role":"authenticated","aud":"authenticated"}',true);
+ perform pg_temp.expect(public.crm_operation('automation.status','{}')->'error'->>'code'='FORBIDDEN','foreign owner denied');
+end $$;
+set local role authenticated;
+select pg_temp.expect((select count(*)=0 from public.automation_work),'foreign owner RLS');
+reset role;
+select set_config('request.jwt.claims','{"sub":"00000000-0000-4000-8000-000000000001","session_id":"00000000-0000-4000-8000-000000000010","role":"authenticated","aud":"authenticated"}',false);
+do $$ declare profiles jsonb='[]';template jsonb;policy jsonb;cv public.resumes;country text;track text;r jsonb;begin
+ select p.policy into policy from public.automation_policies p where user_id=auth.uid();template=policy->'profiles'->0;
+ foreach country in array array['MX','PE'] loop foreach track in array array['ai','general','backend','frontend'] loop
+  insert into public.resumes(user_id,label,country,track,checksum,media_type,storage_path,active) values(auth.uid(),'Synthetic '||track||country,case country when 'MX' then 'Mexico' else 'Peru' end,case track when 'ai' then 'AI' else initcap(track) end,encode(extensions.digest(country||track,'sha256'),'hex'),'application/pdf',auth.uid()::text||'/'||track||country||'.pdf',true) returning * into cv;
+  profiles=profiles||jsonb_build_array(template||jsonb_build_object('id',track||'-'||country,'resume_id',cv.id,'checksum',cv.checksum,'country',country,'track',track));
+ end loop;end loop;
+ policy=policy||jsonb_build_object('profiles',profiles,'enabled',true);
+ r=public.crm_operation('automation.configure',jsonb_build_object('policy',policy,'expected_version',2,'idempotency_key',gen_random_uuid()));
+ perform pg_temp.expect(r->>'version'='3','eight-profile policy saved');
+ perform pg_temp.expect((select count(*)=8 from public.automation_profiles),'all eight profile rows survive configuration');
+ insert into public.automation_work(user_id,profile_id,policy_version,kind,state,attempts,error,checkpoint) values(auth.uid(),'frontend-MX',3,'prepare','failed',3,'MODEL_SCHEMA_INVALID','{"session_id":"synthetic-model-session"}'),(auth.uid(),'frontend-MX',3,'research','blocked',1,'EXA_CREATE_AMBIGUOUS','{"dispatching":true}');
+ r=public.crm_operation('automation.trigger',jsonb_build_object('idempotency_key',gen_random_uuid(),'retry_failed',true));
+ perform pg_temp.expect((select state='queued' and attempts=0 and checkpoint->>'session_id'='synthetic-model-session' from public.automation_work where checkpoint->>'session_id'='synthetic-model-session'),'explicit retry preserves model identity');
+ perform pg_temp.expect((select state='blocked' from public.automation_work where error='EXA_CREATE_AMBIGUOUS'),'retry never recreates ambiguous paid research');
+ perform pg_temp.expect(jsonb_array_length(r->'work_ids')=8,'all eight separate profile searches enqueue');
+end $$;
+
+do $$ declare j public.jobs;c public.companies;cv public.resumes;w public.automation_work;input jsonb;r jsonb;content jsonb;q jsonb;begin
+ select * into j from public.jobs limit 1;select * into c from public.companies where id=j.company_id;select * into cv from public.resumes where user_id=auth.uid() and active limit 1;
+ insert into public.automation_work(user_id,profile_id,policy_version,kind,state,job_id,lease_token,lease_until) values(auth.uid(),'frontend-MX',3,'prepare','running',j.id,gen_random_uuid(),now()+interval '5 minutes') returning * into w;
+ q='{"question_es":"Pregunta","question_en":"Question","answer_es":"Respuesta","answer_en":"Answer","cv_evidence":"Synthetic CV evidence"}';
+ content=jsonb_build_object('introduction_es','Introducción','introduction_en','Introduction','questions',jsonb_build_array(q,q,q),'employer_questions_es','[]'::jsonb,'employer_questions_en','[]'::jsonb,'gaps','[]'::jsonb,'english_required',null,'interview_language',null,'company_facts','[]'::jsonb,'predictions',true,'practice_completed',false);
+ input=jsonb_build_object('idempotency_key',gen_random_uuid(),'work_id',w.id,'lease_token',w.lease_token,'expected_version',w.version,'job_id',j.id,'resume_id',cv.id,'job_version',j.version,'resume_version',cv.version,'company_version',c.version,'expected_pack_version',0,'content',content,'model','synthetic','effort','medium');
+ r=public.crm_operation('automation.pack.save',input||jsonb_build_object('company_version',c.version+1));perform pg_temp.expect(r->'error'->>'code'='CONFLICT','company edit invalidates preparation inputs');
+ r=public.crm_operation('automation.pack.save',input);perform pg_temp.expect(r->'pack'->>'version'='1','bilingual pack persisted');perform pg_temp.expect(public.crm_operation('automation.pack.save',input)=r,'pack replay preserves identity');
+ update public.companies set product='Human edit' where id=c.id;
+ perform pg_temp.expect(public.crm_operation('automation.pack.get',jsonb_build_object('job_id',j.id))->>'stale'='true','human edit makes pack stale');
+end $$;
+
+do $$ declare j public.jobs;c public.companies;r jsonb;begin
+ select * into c from public.companies where user_id=auth.uid() limit 1;
+ insert into public.jobs(user_id,company_id,title,stage) values(auth.uid(),c.id,'Review contact backlog without CV','review') returning * into j;
+ perform public.crm_operation('automation.claim',jsonb_build_object('executor_id',gen_random_uuid(),'idempotency_key',gen_random_uuid()));
+ perform public.crm_operation('automation.claim',jsonb_build_object('executor_id',gen_random_uuid(),'idempotency_key',gen_random_uuid()));
+ perform pg_temp.expect((select count(*)=1 from public.automation_work where job_id=j.id and kind='research' and checkpoint->>'contact_only'='true'),'review contact backlog coalesces without a CV');
+ perform pg_temp.expect((select stage='review' and resume_id is null from public.jobs where id=j.id),'contact queue preserves stage and missing CV');
+ update public.automation_work set state='completed' where job_id=j.id;
+ perform public.crm_operation('automation.claim',jsonb_build_object('executor_id',gen_random_uuid(),'idempotency_key',gen_random_uuid()));
+ perform pg_temp.expect((select count(*)=1 from public.automation_work where job_id=j.id),'contact-only retry bounded to one per day');
+ update public.automation_work set created_at=now()-interval '2 days' where job_id=j.id;
+ perform public.crm_operation('automation.claim',jsonb_build_object('executor_id',gen_random_uuid(),'idempotency_key',gen_random_uuid()));
+ perform pg_temp.expect((select count(*)=1 from public.automation_work where job_id=j.id),'completed unchanged job does not repeatedly consume paid research');
+ insert into public.jobs(user_id,company_id,title,stage) values(auth.uid(),c.id,'Review already has LinkedIn','review') returning * into j;
+ insert into public.contacts(user_id,company_id,job_id,name,linkedin_url) values(auth.uid(),c.id,j.id,'Verified Synthetic Person','https://social.example.invalid/synthetic');
+ perform public.crm_operation('automation.claim',jsonb_build_object('executor_id',gen_random_uuid(),'idempotency_key',gen_random_uuid()));
+ perform pg_temp.expect(not exists(select 1 from public.automation_work where job_id=j.id),'existing LinkedIn contact avoids repeated research');
+end $$;
+
+do $$ declare policy jsonb;flow_version bigint;r jsonb;w jsonb;due timestamptz;paid uuid=gen_random_uuid();begin
+ select p.policy,p.version into policy,flow_version from public.automation_policies p where user_id=auth.uid();
+ update public.automation_work set state='cancelled',lease_token=null,lease_until=null where user_id=auth.uid();
+ policy=policy||'{"enabled":true,"discovery_enabled":false,"research_enabled":true}'::jsonb;
+ r=public.crm_operation('automation.configure',jsonb_build_object('policy',policy,'expected_version',flow_version,'idempotency_key',gen_random_uuid()));flow_version=(r->>'version')::bigint;
+ perform pg_temp.expect(flow_version is not null,'flow policy is accepted');
+ select next_due_at into due from public.automation_profiles where user_id=auth.uid() limit 1;
+ r=public.crm_operation('automation.trigger',jsonb_build_object('scope','existing','idempotency_key',gen_random_uuid()));
+ perform pg_temp.expect(not r ? 'error','existing-only trigger succeeds');
+ perform pg_temp.expect(not exists(select 1 from public.automation_work where user_id=auth.uid() and kind='discovery' and state='queued'),'existing-only does not schedule discovery');
+ perform pg_temp.expect((select next_due_at=due from public.automation_profiles where user_id=auth.uid() limit 1),'existing trigger preserves discovery due time');
+ perform pg_temp.expect(exists(select 1 from public.automation_work where user_id=auth.uid() and policy_version=flow_version and kind<>'discovery' and state='queued'),'existing backlog is scheduled');
+ r=public.crm_operation('automation.trigger',jsonb_build_object('scope','discovery','idempotency_key',gen_random_uuid()));perform pg_temp.expect(r->'error'->>'code'='FORBIDDEN','disabled discovery cannot be manually triggered');
+ policy=policy||'{"discovery_enabled":true,"research_enabled":false}'::jsonb;
+ r=public.crm_operation('automation.configure',jsonb_build_object('policy',policy,'expected_version',flow_version,'idempotency_key',gen_random_uuid()));flow_version=(r->>'version')::bigint;
+ r=public.crm_operation('automation.trigger',jsonb_build_object('scope','discovery','idempotency_key',gen_random_uuid()));
+ perform pg_temp.expect(not r ? 'error','discovery-only trigger succeeds');
+ perform pg_temp.expect(not exists(select 1 from public.automation_work where user_id=auth.uid() and policy_version=flow_version and kind<>'discovery' and state='queued'),'discovery-only does not schedule existing work');
+ r=public.crm_operation('automation.claim',jsonb_build_object('executor_id',gen_random_uuid(),'idempotency_key',gen_random_uuid()));w=r->'work';perform pg_temp.expect(w->>'kind'='discovery','discovery-only leases discovery');
+ r=public.crm_operation('automation.checkpoint',jsonb_build_object('idempotency_key',gen_random_uuid(),'work_id',w->'id','lease_token',w->'lease_token','expected_version',w->'version','state','completed','checkpoint','{}'::jsonb,'children',jsonb_build_array(jsonb_build_object('id',gen_random_uuid(),'kind','prepare','checkpoint','{}'::jsonb))));
+ perform pg_temp.expect(not r ? 'error','disabled downstream child is skipped safely');
+ perform pg_temp.expect(not exists(select 1 from public.automation_work where user_id=auth.uid() and policy_version=flow_version and kind='prepare'),'no preparation child while existing work is paused');
+ insert into public.automation_work(id,user_id,profile_id,policy_version,kind,state,checkpoint) values(paid,auth.uid(),'frontend-MX',flow_version-1,'research','waiting','{"provider_id":"accepted-flow-test","reserved":true}');
+ r=public.crm_operation('automation.claim',jsonb_build_object('executor_id',gen_random_uuid(),'idempotency_key',gen_random_uuid()));w=r->'work';perform pg_temp.expect((w->>'id')::uuid=paid,'accepted paid research remains recoverable while existing flow is paused');
+ r=public.crm_operation('automation.reserve',jsonb_build_object('idempotency_key',gen_random_uuid(),'work_id',w->'id','lease_token',w->'lease_token','expected_version',w->'version','request_id',gen_random_uuid(),'amount_usd',0.1));perform pg_temp.expect(r->'error'->>'code'='FORBIDDEN','paused flow cannot reserve a new paid request');
+ perform pg_temp.expect(not (select crm_private.automation_work_enabled(p.policy,'research','{}'::jsonb) from public.automation_policies p where p.user_id=auth.uid()),'paused existing flow disables new research work');
+ r=public.crm_operation('automation.trigger',jsonb_build_object('scope','unknown','idempotency_key',gen_random_uuid()));perform pg_temp.expect(r->'error'->>'code'='VALIDATION_ERROR','invalid scope rejected');
+end $$;
+do $$ declare policy jsonb;v bigint;r jsonb;intent jsonb;begin
+ select p.policy,p.version into policy,v from public.automation_policies p where user_id=auth.uid();
+ policy=policy||'{"enabled":false,"jev_enabled":false}'::jsonb;
+ intent=jsonb_build_object('policy',policy,'expected_version',v,'idempotency_key',gen_random_uuid());
+ r=public.crm_operation('automation.configure',intent);
+ perform pg_temp.expect(not r ? 'error' and (r->>'version')::bigint=v+1,'Jev toggle saved independently');
+ perform pg_temp.expect(r->'policy'->>'jev_enabled'='false' and r->'policy'->>'enabled'='false','classification save preserves global pause');
+ perform pg_temp.expect(r->'policy'->'discovery_enabled'=policy->'discovery_enabled' and r->'policy'->'research_enabled'=policy->'research_enabled','Jev save preserves discovery and existing flows');
+ perform pg_temp.expect(public.crm_operation('automation.configure',intent)=r,'Jev policy exact receipt replay');
+ r=public.crm_operation('automation.configure',jsonb_build_object('policy',policy||'{"jev_enabled":"true"}'::jsonb,'expected_version',v+1,'idempotency_key',gen_random_uuid()));
+ perform pg_temp.expect(r->'error'->>'code'='VALIDATION_ERROR','Jev toggle rejects string boolean');
+end $$;
+do $$ declare p public.automation_policies;r jsonb;w jsonb;intent jsonb;due timestamptz;triage_job uuid;begin
+ select * into p from public.automation_policies where user_id=auth.uid();
+ update public.automation_work set state='cancelled',lease_token=null,lease_until=null where user_id=auth.uid();
+ select min(next_due_at) into due from public.automation_profiles where user_id=auth.uid();
+ intent=jsonb_build_object('idempotency_key',gen_random_uuid(),'scope','discovery','on_demand',true);
+ r=public.crm_operation('automation.trigger',intent);
+ perform pg_temp.expect(not r ? 'error' and jsonb_array_length(r->'work_ids')>0,'one-time discovery while global pause');
+ perform pg_temp.expect(public.crm_operation('automation.trigger',intent)=r,'manual trigger receipt replay');
+ perform pg_temp.expect((select policy=p.policy and version=p.version from public.automation_policies where user_id=auth.uid()),'manual action preserves saved pause/version');
+ perform pg_temp.expect((select min(next_due_at)=due from public.automation_profiles where user_id=auth.uid()),'manual action preserves discovery due dates');
+ r=public.crm_operation('automation.claim',jsonb_build_object('idempotency_key',gen_random_uuid(),'executor_id',gen_random_uuid()));w=r->'work';
+ perform pg_temp.expect(w->>'kind'='discovery' and w->'checkpoint'->>'on_demand_scope'='discovery','manual discovery claim while paused');
+ r=public.crm_operation('automation.checkpoint',jsonb_build_object('idempotency_key',gen_random_uuid(),'work_id',w->'id','lease_token',w->'lease_token','expected_version',w->'version','state','completed','checkpoint','{"on_demand_scope":"existing"}'::jsonb,'children','[]'::jsonb));
+ perform pg_temp.expect(r->'work'->'checkpoint'->>'on_demand_scope'='discovery','checkpoint cannot forge a larger manual grant');
+ update public.automation_work set state='cancelled' where user_id=auth.uid();
+ r=public.crm_operation('automation.trigger',jsonb_build_object('idempotency_key',gen_random_uuid(),'scope','classification','on_demand',true));
+ perform pg_temp.expect(not r ? 'error' and jsonb_array_length(r->'work_ids')>0,'standalone classification queued while paused');
+ r=public.crm_operation('automation.claim',jsonb_build_object('idempotency_key',gen_random_uuid(),'executor_id',gen_random_uuid()));w=r->'work';
+ perform pg_temp.expect(w->>'kind'='classify','classification claims only classifier work');
+ r=public.crm_operation('automation.reserve',jsonb_build_object('idempotency_key',gen_random_uuid(),'work_id',w->'id','lease_token',w->'lease_token','expected_version',w->'version','request_id',gen_random_uuid(),'amount_usd',0.1));
+ perform pg_temp.expect(r->'error'->>'code'='FORBIDDEN','classification cannot reserve Exa spend');
+ perform pg_temp.expect(not crm_private.automation_work_enabled(p.policy||'{"enabled":true,"research_enabled":true}'::jsonb,'research','{"on_demand_scope":"discovery"}'::jsonb),'manual discovery never grants research children');
+ update public.automation_work set state='cancelled' where user_id=auth.uid();
+ r=public.crm_operation('automation.trigger',jsonb_build_object('idempotency_key',gen_random_uuid(),'scope','existing','on_demand',true));
+ perform pg_temp.expect(not r ? 'error' and jsonb_array_length(r->'work_ids')>0,'existing work queued while paused');
+ r=public.crm_operation('automation.claim',jsonb_build_object('idempotency_key',gen_random_uuid(),'executor_id',gen_random_uuid()));w=r->'work';
+ perform pg_temp.expect(w->'checkpoint'->>'on_demand_scope'='existing','existing one-time work claims while paused');
+
+ -- Latest persistent triage is independent of the status window and read-only.
+ update public.automation_work set state='cancelled' where user_id=auth.uid();
+ -- Isolate latest-result assertions from newer cancelled work created by previous cases.
+ insert into public.jobs(user_id,company_id,title,stage)
+ values(auth.uid(),(select id from public.companies where user_id=auth.uid() order by id limit 1),'Classification history fixture','radar')
+ returning id into triage_job;
+ insert into public.automation_work(user_id,profile_id,policy_version,kind,state,job_id,checkpoint,created_at)
+ values(auth.uid(),'frontend-MX',p.version,'classify','completed',triage_job,
+ '{"jev":{"status":"completed","rubric":"vacancy-fit-2","judgments":{"frontend-MX":{"choice":"strong","confidence":0.82}}}}',now()-interval '1 hour');
+ insert into public.automation_work(user_id,profile_id,policy_version,kind,state,checkpoint,created_at)
+ select auth.uid(),'frontend-MX',p.version,'discovery','completed','{}',now()-interval '5 minutes' from generate_series(1,55);
+ r=public.crm_operation('jobs.get',jsonb_build_object('id',triage_job));
+ perform pg_temp.expect(r->'triage'->'jev'->'judgments'->'frontend-MX'->>'choice'='strong','vacancy detail exposes persisted classification');
+ r=public.crm_operation('jobs.list','{"limit":1}');
+ perform pg_temp.expect(r->'items'->0 ? 'triage','paged list exposes triage without changing cursor');
+ insert into public.automation_work(user_id,profile_id,policy_version,kind,state,job_id,checkpoint,created_at)
+ values(auth.uid(),'frontend-MX',p.version,'classify','queued',triage_job,'{}',now());
+ r=crm_private.job_triage(auth.uid(),triage_job);
+ perform pg_temp.expect(r->>'state'='queued' and r->'jev'='null'::jsonb and r->'stale'='false'::jsonb,'pending refresh does not expose old positive judgment');
+ update public.automation_work set checkpoint='{"jev":{"status":"SOURCE_UNAVAILABLE"}}',state='completed'
+ where user_id=auth.uid() and job_id=triage_job and state='queued';
+ r=crm_private.job_triage(auth.uid(),triage_job);
+ perform pg_temp.expect(r->'jev'->>'status'='SOURCE_UNAVAILABLE','source failure supersedes older positive result');
+ update public.automation_policies set version=version+1 where user_id=auth.uid();
+ r=crm_private.job_triage(auth.uid(),triage_job);
+ perform pg_temp.expect((r->>'stale')::boolean,'changed policy makes prior result stale');
+ perform set_config('request.jwt.claims','{"sub":"00000000-0000-4000-8000-000000000002","session_id":"00000000-0000-4000-8000-000000000020","role":"authenticated","aud":"authenticated"}',true);
+ perform pg_temp.expect(crm_private.job_triage('00000000-0000-4000-8000-000000000001',triage_job) is null,'classification projection denies foreign owner');
+end $$;
+rollback;

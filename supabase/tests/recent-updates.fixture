@@ -1,0 +1,37 @@
+\set ON_ERROR_STOP on
+begin;
+delete from crm_private.settings;
+insert into auth.users(id,email) values('00000000-0000-4000-8000-000000000071','recent@example.invalid'),('00000000-0000-4000-8000-000000000072','foreign-recent@example.invalid');
+insert into auth.sessions(id,user_id) values('00000000-0000-4000-8000-000000000073','00000000-0000-4000-8000-000000000071');
+insert into crm_private.settings(owner_id,mcp_resource) values('00000000-0000-4000-8000-000000000071','https://example.invalid/functions/v1/mcp');
+select set_config('request.jwt.claims','{"sub":"00000000-0000-4000-8000-000000000071","session_id":"00000000-0000-4000-8000-000000000073","role":"authenticated"}',false);
+create or replace function pg_temp.expect(value boolean,label text) returns void language plpgsql as $$begin if value is distinct from true then raise exception 'FAILED: %',label;end if;end$$;
+do $$
+declare c jsonb;j jsonb;r jsonb;items jsonb;item jsonb;n integer;foreign_job uuid;owner uuid=auth.uid();begin
+ r=public.crm_operation('dashboard.summary','{}');
+ perform pg_temp.expect(r->'recent_updates'->'items'='[]','canonical empty summary');
+ c=public.crm_operation('companies.upsert',jsonb_build_object('name','Recent fixture','idempotency_key',gen_random_uuid()));
+ j=public.crm_operation('jobs.upsert',jsonb_build_object('company_id',c->'id','title','Recent vacancy','notes','secret vacancy text','idempotency_key',gen_random_uuid()));
+ r=public.crm_operation('dashboard.summary','{}');
+ perform pg_temp.expect(r->'recent_updates'->'items'->0->>'history'='unavailable','creation does not invent a before snapshot');
+ r=public.crm_operation('jobs.upsert',jsonb_build_object('id',j->'id','expected_version',1,'location','Remote','idempotency_key',gen_random_uuid()));
+ items=public.crm_operation('dashboard.summary','{}')->'recent_updates'->'items';item=items->0;
+ perform pg_temp.expect(jsonb_array_length(items)=1 and item->>'entity_id'=j->>'id' and item->>'history'='recorded' and item->'changed_fields'='["location"]','latest changed fields canonical and distinct');
+ perform pg_temp.expect(item->>'occurred_at' is not null and item->>'event_id' is not null and not item ? 'before' and item::text not like '%secret vacancy text%','real event time with no private values');
+ insert into public.audit_events(user_id,entity_type,entity_id,action,actor_subject,actor_kind,request_id,before,after,created_at)
+ values(owner,'jobs',(j->>'id')::uuid,'import.jobs',owner::text,'user',gen_random_uuid(),null,jsonb_build_object('id',j->'id','version',2,'stage','radar'),clock_timestamp());
+ item=public.crm_operation('dashboard.summary','{}')->'recent_updates'->'items'->0;
+ perform pg_temp.expect(item->>'history'='unavailable' and item->'changed_fields'='[]','legacy import has no reconstructed field changes');
+ perform pg_temp.expect(jsonb_array_length(public.crm_operation('dashboard.summary','{}')->'workspace'->'featured_jobs')=1,'bounded canonical workspace jobs');
+ insert into public.companies(user_id,name) values('00000000-0000-4000-8000-000000000072','Foreign company') returning id into foreign_job;
+ insert into public.jobs(user_id,company_id,title) values('00000000-0000-4000-8000-000000000072',foreign_job,'Foreign vacancy') returning id into foreign_job;
+ perform pg_temp.expect(not crm_private.erasure_mentions(public.crm_operation('dashboard.summary','{}')->'recent_updates',array[foreign_job::text]),'recent summary owner isolation');
+ for n in 1..15 loop
+  perform public.crm_operation('jobs.upsert',jsonb_build_object('company_id',c->'id','title','Extra '||n,'idempotency_key',gen_random_uuid()));
+ end loop;
+ items=public.crm_operation('dashboard.summary','{}')->'recent_updates'->'items';
+ perform pg_temp.expect(jsonb_array_length(items)=12,'bounded 12 owner updates');
+ perform set_config('request.jwt.claims','{"sub":"00000000-0000-4000-8000-000000000072","role":"authenticated"}',true);
+ perform pg_temp.expect(public.crm_operation('dashboard.summary','{}')->'error'->>'code'='FORBIDDEN','other owner summary denied');
+end $$;
+rollback;

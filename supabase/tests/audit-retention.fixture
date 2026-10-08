@@ -1,0 +1,47 @@
+\set ON_ERROR_STOP on
+begin;
+delete from crm_private.settings;
+insert into auth.users(id,email) values('00000000-0000-4000-8000-000000000009','retention@example.invalid'),('00000000-0000-4000-8000-000000000011','foreign-retention@example.invalid');
+insert into auth.sessions(id,user_id) values('00000000-0000-4000-8000-000000000090','00000000-0000-4000-8000-000000000009');
+insert into crm_private.settings(owner_id,mcp_resource) values('00000000-0000-4000-8000-000000000009','https://example.invalid/functions/v1/mcp');
+select set_config('request.jwt.claims','{"sub":"00000000-0000-4000-8000-000000000009","session_id":"00000000-0000-4000-8000-000000000090","role":"authenticated"}',false);
+create or replace function pg_temp.expect(value boolean,label text) returns void language plpgsql as $$begin if value is distinct from true then raise exception 'FAILED: %',label;end if;end$$;
+do $$
+declare owner uuid='00000000-0000-4000-8000-000000000009';expired uuid=gen_random_uuid();boundary uuid=gen_random_uuid();fresh uuid=gen_random_uuid();foreign_event uuid=gen_random_uuid();malicious uuid=gen_random_uuid();historical_job uuid=gen_random_uuid();funnel jsonb;old_base jsonb;fresh_row jsonb;foreign_row jsonb;receipt_row jsonb;task_row jsonb;task uuid=gen_random_uuid();changed integer;
+begin
+ insert into public.audit_events(id,user_id,created_at,entity_type,entity_id,action,actor_subject,actor_kind,request_id,before,after) values
+ (expired,owner,now()-interval '91 days','contacts',gen_random_uuid(),'contacts.upsert',owner::text,'user',gen_random_uuid(),jsonb_build_object('id',gen_random_uuid(),'version',1,'status','connected','email','old@example.invalid','notes','private before','reason','free explanation'),jsonb_build_object('id',gen_random_uuid(),'version',2,'status','replied','draft_message','private draft','linkedin_url','https://example.invalid/person','notes','private after')),
+ (boundary,owner,now()-interval '90 days','contacts',gen_random_uuid(),'contacts.upsert',owner::text,'user',gen_random_uuid(),null,'{"version":1,"status":"uncontacted","email":"boundary@example.invalid"}'),
+ (fresh,owner,now()-interval '90 days'+interval '1 second','contacts',gen_random_uuid(),'contacts.upsert',owner::text,'user',gen_random_uuid(),null,'{"version":1,"status":"uncontacted","email":"fresh@example.invalid","notes":"keep for full ninety days"}'),
+ (foreign_event,'00000000-0000-4000-8000-000000000011',now()-interval '91 days','contacts',gen_random_uuid(),'contacts.upsert','foreign','user',gen_random_uuid(),null,'{"email":"foreign@example.invalid","notes":"unchanged"}'),
+ (malicious,owner,now()-interval '91 days','contacts',gen_random_uuid(),'contacts.upsert',owner::text,'user',gen_random_uuid(),null,'{"id":"email@example.invalid","version":"private notes","status":"free text","stage":"person name","state":"private draft","applied_at":"not a date","email":"secret@example.invalid","nested":{"id":"hidden"}}'),
+ (historical_job,owner,now()-interval '91 days','jobs',gen_random_uuid(),'jobs.transition',owner::text,'user',gen_random_uuid(),'{"stage":"radar","applied_at":null,"notes":"before private"}',jsonb_build_object('stage','applied','applied_at',(now()-interval '91 days')::timestamptz,'notes','after private'));
+ select to_jsonb(a)-array['before','after'] into old_base from public.audit_events a where id=expired;
+ select to_jsonb(a) into fresh_row from public.audit_events a where id=fresh;
+ select to_jsonb(a) into foreign_row from public.audit_events a where id=foreign_event;
+ insert into public.mutation_receipts(user_id,idempotency_key,operation,payload_hash,response) values(owner,gen_random_uuid(),'contacts.upsert','retained','{"email":"receipt remains outside policy"}') returning to_jsonb(mutation_receipts.*) into receipt_row;
+ insert into public.crm_jobs(id,user_id,kind,state,payload,request_id) values(task,owner,'bulk_import','completed','{"email":"task outside policy"}',gen_random_uuid()) returning to_jsonb(crm_jobs.*) into task_row;
+ funnel=public.crm_operation('dashboard.summary','{}')->'funnel';
+ perform pg_temp.expect(funnel->>'applied'='1','historical funnel is established');
+ begin update public.audit_events set after='{}' where id=expired;raise exception 'Expected append-only denial';exception when invalid_parameter_value then null;end;
+ changed=crm_private.minimize_audit_payloads();perform pg_temp.expect(changed=4,'expired and exact ninety-day boundary minimized');
+ perform pg_temp.expect((select to_jsonb(a)-array['before','after']=old_base from public.audit_events a where id=expired),'identity dates action version metadata are immutable');
+ perform pg_temp.expect((select before ? 'id' and before->>'version'='1' and before->>'status'='connected' and not(before ? 'email' or before ? 'notes' or before ? 'reason') and after->>'status'='replied' and not(after ? 'draft_message' or after ? 'linkedin_url' or after ? 'notes') from public.audit_events where id=expired),'PII and free reason removed while valid metadata remains');
+ perform pg_temp.expect((select after='{}'::jsonb from public.audit_events where id=malicious),'allowed keys cannot hide free text invalid identifiers or nested PII');
+ perform pg_temp.expect((select to_jsonb(a)=fresh_row from public.audit_events a where id=fresh),'fresh payload retained until full ninety days');
+ perform pg_temp.expect((select to_jsonb(a)=foreign_row from public.audit_events a where id=foreign_event),'foreign owner untouched');
+ perform pg_temp.expect(public.crm_operation('dashboard.summary','{}')->'funnel'=funnel,'historical funnel unaffected');
+ perform pg_temp.expect((select to_jsonb(r)=receipt_row from public.mutation_receipts r where id=(receipt_row->>'id')::uuid) and (select to_jsonb(j)=task_row from public.crm_jobs j where id=task),'receipts and tasks untouched');
+ perform pg_temp.expect((select count(*)=1 and bool_and(before is null and after='{}'::jsonb) from public.audit_events where action='audit.payload_retention'),'maintenance emits one payload-free audit');
+ perform pg_temp.expect(crm_private.minimize_audit_payloads()=0 and (select count(*)=1 from public.audit_events where action='audit.payload_retention'),'repeat minimization is idempotent');
+ perform pg_temp.expect(coalesce(current_setting('crm.audit_retention',true),'')<>'90days','retention authorization flag restored');
+ perform pg_temp.expect(not has_function_privilege('authenticated','crm_private.minimize_audit_payloads()','EXECUTE') and not has_function_privilege('crm_worker','crm_private.minimize_audit_payloads()','EXECUTE'),'clients and delivery worker cannot invoke retention');
+end $$;
+set local role authenticated;
+select set_config('crm.audit_retention','90days',true);
+do $$begin
+ begin perform crm_private.minimize_audit_payloads();raise exception 'Expected retention permission denied';exception when insufficient_privilege then null;end;
+ begin update public.audit_events set after='{}';raise exception 'Expected client audit update denied';exception when insufficient_privilege then null;end;
+end$$;
+reset role;
+rollback;

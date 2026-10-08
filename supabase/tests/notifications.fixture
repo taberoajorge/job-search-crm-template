@@ -1,0 +1,162 @@
+begin;
+delete from crm_private.settings;
+insert into auth.users(id,email) values('00000000-0000-4000-8000-000000000001','owner@example.invalid'),('00000000-0000-4000-8000-000000000002','other@example.invalid');
+insert into auth.sessions(id,user_id) values('00000000-0000-4000-8000-000000000010','00000000-0000-4000-8000-000000000001'),('00000000-0000-4000-8000-000000000020','00000000-0000-4000-8000-000000000002');
+insert into crm_private.settings(owner_id,mcp_resource) values('00000000-0000-4000-8000-000000000001','https://example.invalid/functions/v1/mcp');
+select set_config('request.jwt.claims','{"sub":"00000000-0000-4000-8000-000000000001","session_id":"00000000-0000-4000-8000-000000000010","role":"authenticated","aud":"authenticated"}',false);
+create or replace function pg_temp.expect(value boolean,label text) returns void language plpgsql as $$ begin if value is distinct from true then raise exception 'FAILED: %',label;end if;end $$;
+
+create temporary table notification_test_delivery(delivery jsonb) on commit drop;
+do $$ declare cv jsonb;profile jsonb;policy jsonb;company jsonb;job jsonb;w jsonb;w2 jsonb;r jsonb;effect jsonb;replay jsonb;b jsonb;listing jsonb;d jsonb;frozen text;n integer;pack jsonb;closedjob jsonb;missing text;baseline jsonb;receipt_count bigint;invalid_key uuid;before_state jsonb;begin
+ insert into public.resumes(user_id,label,country,track,checksum,media_type,storage_path,active) values(auth.uid(),'Synthetic','Mexico','Frontend',repeat('a',64),'application/pdf',auth.uid()::text||'/synthetic.pdf',true) returning to_jsonb(resumes) into cv;
+ profile=jsonb_build_object('id','frontend-MX','country','MX','track','frontend','resume_id',cv->'id','checksum',repeat('a',64),'authorized_country',true,'remote',true,'terms',jsonb_build_array('React'),'exclusions','[]'::jsonb,'allow_unknown_salary',true,'salary_min',null,'currency',null,'salary_period',null);
+ policy=jsonb_build_object('enabled',true,'interval_hours',2,'revalidate_hours',24,'timezone','America/Mexico_City','profiles',jsonb_build_array(profile),'sources',jsonb_build_array('autoapply','openhire','exa'),'model','default','effort','medium','candidates_per_profile',3,'exa_per_run_usd',0.1,'exa_daily_usd',1,'exa_monthly_usd',20,'digest_email',false,'closure_email',false);
+ perform public.crm_operation('automation.configure',jsonb_build_object('policy',policy,'expected_version',0,'idempotency_key',gen_random_uuid()));
+ r=public.crm_operation('automation.claim',jsonb_build_object('executor_id',gen_random_uuid(),'idempotency_key',gen_random_uuid()));w=r->'work';
+ company=public.crm_operation('companies.upsert',jsonb_build_object('name','Public <Company>','idempotency_key',gen_random_uuid()));
+ effect=jsonb_build_object('work_id',w->'id','lease_token',w->'lease_token','expected_version',w->'version','idempotency_key',gen_random_uuid(),'operation','jobs.upsert','input',jsonb_build_object('company_id',company->'id','title','React <Engineer>','idempotency_key',gen_random_uuid()));
+ r=public.crm_operation('automation.commit',effect);job=r->'result';perform pg_temp.expect(job->>'id' is not null,'guarded job created');
+ perform pg_temp.expect((select count(*)=1 from public.automation_events where job_id=(job->>'id')::uuid),'one atomic discovery event');
+ perform pg_temp.expect((select cycle_id is not null from public.automation_work where id=(w->>'id')::uuid),'actual root cycle recorded');
+ replay=public.crm_operation('automation.commit',effect);perform pg_temp.expect(replay=r,'exact effect receipt');
+ perform pg_temp.expect((select count(*)=1 from public.automation_events),'replay adds no history');
+ listing=public.crm_operation('notifications.list','{}');b=listing->'items'->0;
+ perform pg_temp.expect(listing->>'unread_count'='1' and b->>'vacancies'='1','history exists without email');
+ perform pg_temp.expect((select count(*)=0 from crm_private.automation_emails),'email disabled does not queue');
+ r=public.crm_operation('notifications.get',jsonb_build_object('id',b->'id'));
+ perform pg_temp.expect(r->'items'->0->'events'->0->'snapshot'->>'title'='React <Engineer>','safe committed snapshot');
+ perform pg_temp.expect(not (r::text like '%synthetic.pdf%'),'no CV copied into history');
+ -- Later material changes of the same category remain visible; notes do not.
+ effect=effect||jsonb_build_object('idempotency_key',gen_random_uuid(),'input',jsonb_build_object('id',job->'id','expected_version',1,'salary_text','USD 100','notes','private secret','idempotency_key',gen_random_uuid()));
+ r=public.crm_operation('automation.commit',effect);perform pg_temp.expect(r->'result'->>'version'='2','material update persisted');
+ effect=effect||jsonb_build_object('idempotency_key',gen_random_uuid(),'input',jsonb_build_object('id',job->'id','expected_version',2,'salary_text','USD 200','idempotency_key',gen_random_uuid()));
+ perform public.crm_operation('automation.commit',effect);
+ perform pg_temp.expect((select count(*)=2 from public.automation_events where kind='updated'),'later same-kind updates not lifetime suppressed');
+ perform pg_temp.expect((select bool_and(snapshot::text not like '%private secret%') from public.automation_events),'private notes excluded');
+ n=(select count(*) from public.automation_events);
+ effect=effect||jsonb_build_object('idempotency_key',gen_random_uuid(),'input',jsonb_build_object('id',job->'id','expected_version',3,'notes','different secret','idempotency_key',gen_random_uuid()));
+ perform public.crm_operation('automation.commit',effect);
+ perform pg_temp.expect((select count(*)=n from public.automation_events),'notes-only update emits no alert');
+ -- Stale/invalid business writes cannot emit events.
+ effect=effect||jsonb_build_object('idempotency_key',gen_random_uuid(),'input',jsonb_build_object('id',job->'id','expected_version',1,'salary_text','stale','idempotency_key',gen_random_uuid()));
+ r=public.crm_operation('automation.commit',effect);perform pg_temp.expect(r ? 'error' and (select count(*)=n from public.automation_events),'failed effect emits nothing');
+ -- A second claimed profile can update the same vacancy without double-counting it.
+ insert into public.automation_work(user_id,profile_id,policy_version,kind,state,job_id,lease_token,lease_until,executor_id)
+ values(auth.uid(),'backend-MX',1,'research','running',(job->>'id')::uuid,gen_random_uuid(),now()+interval '5 minutes',gen_random_uuid()) returning to_jsonb(automation_work) into w2;
+ effect=jsonb_build_object('work_id',w2->'id','lease_token',w2->'lease_token','expected_version',w2->'version','idempotency_key',gen_random_uuid(),'operation','jobs.upsert','input',jsonb_build_object('id',job->'id','expected_version',4,'salary_text','USD 250','idempotency_key',gen_random_uuid()));
+ r=public.crm_operation('automation.commit',effect);perform pg_temp.expect(not(r ? 'error'),'second profile guarded material update');
+ perform pg_temp.expect((select count(distinct profile_id)=2 and count(distinct job_id)=1 from public.automation_events where job_id=(job->>'id')::uuid),'profile overlap preserves one affected vacancy');
+ update public.automation_work set state='completed',lease_token=null,lease_until=null where id=(w2->>'id')::uuid;
+ r=public.crm_operation('notifications.read',jsonb_build_object('id',b->'id','expected_version',b->'version','read',true,'idempotency_key',gen_random_uuid()));perform pg_temp.expect(r->'error'->>'code'='CONFLICT','history version protects concurrent change');
+ listing=public.crm_operation('notifications.list','{}');b=listing->'items'->0;
+ r=public.crm_operation('notifications.read',jsonb_build_object('id',b->'id','expected_version',b->'version','idempotency_key',gen_random_uuid()));
+ perform pg_temp.expect(r->'error'->>'code'='VALIDATION_ERROR','missing read boolean rejected before mutation');
+ baseline=jsonb_build_object('id',b->'id','expected_version',b->'version','read',true,'idempotency_key',gen_random_uuid());
+ select to_jsonb(nb) into before_state from public.notification_batches nb where id=(b->>'id')::uuid;
+ select count(*) into receipt_count from public.mutation_receipts;
+ foreach missing in array array['id','expected_version','read','idempotency_key'] loop
+  r=public.crm_operation('notifications.read',baseline-missing);
+  perform pg_temp.expect(r->'error'->>'code'='VALIDATION_ERROR','missing notification read field: '||missing);
+ end loop;
+ r=public.crm_operation('notifications.read',baseline||'{"read":"true"}');
+ perform pg_temp.expect(r->'error'->>'code'='VALIDATION_ERROR','string read flag rejected');
+ r=public.crm_operation('notifications.configure',jsonb_build_object('expected_version',coalesce((select version from public.notification_state where user_id=auth.uid()),1),'live_email',1,'disclosure','generic','idempotency_key',gen_random_uuid()));
+ perform pg_temp.expect(r->'error'->>'code'='VALIDATION_ERROR','numeric live_email rejected');
+ r=public.crm_operation('notifications.configure',jsonb_build_object('expected_version',coalesce((select version from public.notification_state where user_id=auth.uid()),1),'live_email',false,'disclosure','other','idempotency_key',gen_random_uuid()));
+ perform pg_temp.expect(r->'error'->>'code'='VALIDATION_ERROR','unknown disclosure rejected');
+ perform pg_temp.expect((select to_jsonb(nb)=before_state from public.notification_batches nb where id=(b->>'id')::uuid) and (select count(*)=receipt_count from public.mutation_receipts),'invalid read has no data or receipt effects');
+ effect=jsonb_build_object('id',b->'id','expected_version',b->'version','read',true,'idempotency_key',gen_random_uuid());
+ r=public.crm_operation('notifications.read',effect);perform pg_temp.expect(r->>'read_at' is not null,'explicit read');perform pg_temp.expect(public.crm_operation('notifications.read',effect)=r,'read replay');
+ r=public.crm_operation('notifications.get',jsonb_build_object('id',b->'id','job_id',gen_random_uuid()));perform pg_temp.expect(r->'error'->>'code'='NOT_FOUND','job must belong to batch');
+ -- Linked contact records add counts without copying personal data.
+ effect=jsonb_build_object('work_id',w->'id','lease_token',w->'lease_token','expected_version',w->'version','idempotency_key',gen_random_uuid(),'operation','contacts.upsert','input',jsonb_build_object('company_id',company->'id','job_id',job->'id','name','Private Contact','email','private@example.invalid','linkedin_url','https://social.example.invalid/synthetic','idempotency_key',gen_random_uuid()));
+ r=public.crm_operation('automation.commit',effect);perform pg_temp.expect(not(r ? 'error'),'guarded linked contact');
+ perform pg_temp.expect((select count(*)=1 from public.automation_events where kind='contacts'),'one contact count event');
+ perform pg_temp.expect((select bool_and(snapshot::text not like '%private@example.invalid%' and snapshot::text not like '%Private Contact%') from public.automation_events),'contact PII excluded');
+ -- Company research and confirmed closure produce real committed changes.
+ effect=jsonb_build_object('work_id',w->'id','lease_token',w->'lease_token','expected_version',w->'version','idempotency_key',gen_random_uuid(),'operation','companies.upsert','input',jsonb_build_object('id',company->'id','expected_version',1,'product','Updated public product','idempotency_key',gen_random_uuid()));
+ r=public.crm_operation('automation.commit',effect);company=r->'result';perform pg_temp.expect((select count(*)=1 from public.automation_events where kind='company'),'company research update linked to vacancy');
+ effect=effect||jsonb_build_object('idempotency_key',gen_random_uuid(),'operation','jobs.upsert','input',jsonb_build_object('company_id',company->'id','title','Closing vacancy','idempotency_key',gen_random_uuid()));
+ r=public.crm_operation('automation.commit',effect);closedjob=r->'result';
+ effect=effect||jsonb_build_object('idempotency_key',gen_random_uuid(),'operation','verifications.record','input',jsonb_build_object('job_id',closedjob->'id','status','closed','checked_at',now(),'notes','Original explicitly closed','evidence_url','https://example.invalid/careers/closed','idempotency_key',gen_random_uuid()));
+ r=public.crm_operation('automation.commit',effect);perform pg_temp.expect(not(r ? 'error'),'real closure evidence recorded');
+ effect=effect||jsonb_build_object('idempotency_key',gen_random_uuid(),'operation','jobs.transition','input',jsonb_build_object('id',closedjob->'id','expected_version',1,'stage','archived','reason','Verified closure','idempotency_key',gen_random_uuid()));
+ r=public.crm_operation('automation.commit',effect);perform pg_temp.expect(not(r ? 'error') and (select count(*)=1 from public.automation_events where kind='closed' and snapshot->'changes'->>'evidence_url'='https://example.invalid/careers/closed'),'real archived transition includes evidence');
+ -- Correlation inherits through checkpoint children.
+ r=public.crm_operation('automation.checkpoint',jsonb_build_object('idempotency_key',gen_random_uuid(),'work_id',w->'id','lease_token',w->'lease_token','expected_version',w->'version','state','completed','checkpoint','{}'::jsonb,'error',null,'children',jsonb_build_array(jsonb_build_object('id',gen_random_uuid(),'kind','prepare','job_id',job->'id','checkpoint','{}'::jsonb))));
+ perform pg_temp.expect((select count(*)=1 from public.automation_work c join public.automation_work parent on parent.id=c.parent_work_id where c.job_id=(job->>'id')::uuid and c.cycle_id=parent.cycle_id),'child inherits real origin');
+ -- A guarded preparation save emits once for unchanged content/inputs.
+ r=public.crm_operation('automation.claim',jsonb_build_object('executor_id',gen_random_uuid(),'idempotency_key',gen_random_uuid()));w=r->'work';
+ perform pg_temp.expect(w->>'kind'='prepare','preparation claim');
+ job=public.crm_operation('jobs.get',jsonb_build_object('id',job->'id'));
+ pack=jsonb_build_object('introduction_es','Presentación','introduction_en','Introduction','questions',jsonb_build_array(jsonb_build_object('question_es','Pregunta','question_en','Question','answer_es','Respuesta','answer_en','Answer','cv_evidence','Synthetic evidence'),jsonb_build_object('question_es','Pregunta 2','question_en','Question 2','answer_es','Respuesta','answer_en','Answer','cv_evidence','Synthetic evidence'),jsonb_build_object('question_es','Pregunta 3','question_en','Question 3','answer_es','Respuesta','answer_en','Answer','cv_evidence','Synthetic evidence')),'employer_questions_es','[]'::jsonb,'employer_questions_en','[]'::jsonb,'gaps','[]'::jsonb,'english_required',null,'interview_language',null,'company_facts','[]'::jsonb,'predictions',true,'practice_completed',false);
+ effect=jsonb_build_object('idempotency_key',gen_random_uuid(),'work_id',w->'id','lease_token',w->'lease_token','expected_version',w->'version','job_id',job->'id','resume_id',cv->'id','job_version',job->'version','resume_version',1,'company_version',company->'version','expected_pack_version',0,'content',pack,'model','default','effort','medium');
+ r=public.crm_operation('automation.pack.save',effect);perform pg_temp.expect(not(r ? 'error') and (select count(*)=1 from public.automation_events where kind='prepared'),'guarded preparation emits ready event');
+ effect=effect||jsonb_build_object('idempotency_key',gen_random_uuid(),'expected_pack_version',1);r=public.crm_operation('automation.pack.save',effect);perform pg_temp.expect(not(r ? 'error') and (select count(*)=1 from public.automation_events where kind='prepared'),'unchanged preparation content does not emit another alert');
+ -- Read cursor binding, second page, and cutoff excludes later changes.
+ insert into public.notification_batches(user_id,window_start,window_end,created_at,updated_at) values(auth.uid(),now()-interval '2 days',now()-interval '2 days'+interval '15 minutes',now()-interval '2 days',now()-interval '2 days');
+ listing=public.crm_operation('notifications.list','{"limit":1}');perform pg_temp.expect((listing->>'has_more')::boolean,'history page has next');
+ r=public.crm_operation('notifications.list',jsonb_build_object('limit',1,'cursor',listing->>'next_cursor'));perform pg_temp.expect(jsonb_array_length(r->'items')=1 and r->'items'->0->>'id'<>listing->'items'->0->>'id','stable second page');
+ r=public.crm_operation('notifications.list',jsonb_build_object('cursor',listing->>'next_cursor','unread',true));perform pg_temp.expect(r->'error'->>'code'='VALIDATION_ERROR','cursor rejects changed filters');
+ baseline=jsonb_build_object('expected_version',listing->'state_version','cutoff',now()-interval '1 day','idempotency_key',gen_random_uuid());
+ select jsonb_agg(to_jsonb(nb) order by id) into before_state from public.notification_batches nb where user_id=auth.uid();
+ select count(*) into receipt_count from public.mutation_receipts;
+ foreach missing in array array['expected_version','cutoff','idempotency_key'] loop
+  r=public.crm_operation('notifications.mark_all',baseline-missing);
+  perform pg_temp.expect(r->'error'->>'code'='VALIDATION_ERROR','missing notification mark-all field: '||missing);
+ end loop;
+ perform pg_temp.expect((select jsonb_agg(to_jsonb(nb) order by id)=before_state from public.notification_batches nb where user_id=auth.uid()) and (select count(*)=receipt_count from public.mutation_receipts),'invalid mark-all has no data or receipt effects');
+ r=public.crm_operation('notifications.mark_all',jsonb_build_object('expected_version',listing->'state_version','cutoff',now()-interval '1 day','idempotency_key',gen_random_uuid()));perform pg_temp.expect(not (r ? 'error'),'captured cutoff accepted');
+ perform pg_temp.expect((select read_at is not null from public.notification_batches where user_id=auth.uid() and window_start<now()-interval '1 day') and (select read_at is null from public.notification_batches where id=(b->>'id')::uuid),'cutoff marks only older history read');
+ -- Close the batch window and consent to safe detail. No live email until opt-in.
+ update public.notification_batches set window_start=now()-interval '30 minutes',window_end=now()-interval '15 minutes' where id=(b->>'id')::uuid;
+ r=public.crm_operation('notifications.preferences','{}');
+ perform pg_temp.expect(r->>'disclosure'='generic' and r->>'live_email'='false','default generic and disabled');
+ baseline=jsonb_build_object('expected_version',r->'version','live_email',true,'disclosure','vacancy_summary','idempotency_key',gen_random_uuid());
+ select to_jsonb(ns) into before_state from public.notification_state ns where user_id=auth.uid();
+ select count(*) into receipt_count from public.mutation_receipts;
+ foreach missing in array array['expected_version','live_email','disclosure','idempotency_key'] loop
+  r=public.crm_operation('notifications.configure',baseline-missing);
+  perform pg_temp.expect(r->'error'->>'code'='VALIDATION_ERROR','missing notification configure field: '||missing);
+ end loop;
+ perform pg_temp.expect((select to_jsonb(ns)=before_state from public.notification_state ns where user_id=auth.uid()) and (select count(*)=receipt_count from public.mutation_receipts),'invalid configure has no data or receipt effects');
+ r=public.crm_operation('notifications.preferences','{}');
+ r=public.crm_operation('notifications.configure',jsonb_build_object('expected_version',r->'version','live_email',true,'disclosure','vacancy_summary','idempotency_key',gen_random_uuid()));
+ d=crm_private.automation_email_claim_v2();perform pg_temp.expect(d->>'kind'='updates' and d->>'disclosure'='vacancy_summary','owner consent queues rich batch');
+ insert into notification_test_delivery values(d);
+ perform pg_temp.expect(d->'counts'->>'vacancies'='2','batch counts unique jobs despite many events');
+ frozen=crm_private.automation_email_freeze((d->>'id')::uuid,(d->>'lease_token')::uuid,jsonb_build_object('from','test@example.invalid','to',jsonb_build_array('owner@example.invalid'),'subject','Immutable','text','Original request'));
+ perform crm_private.automation_email_finish((d->>'id')::uuid,(d->>'lease_token')::uuid,0,null);
+ update crm_private.automation_emails set next_attempt_at=now() where id=(d->>'id')::uuid;
+ replay=d;d=crm_private.automation_email_claim_v2();perform pg_temp.expect(d->>'id'=replay->>'id' and d->>'request_body'=frozen,'crash recovery preserves bytes and identity');
+ perform pg_temp.expect(crm_private.automation_email_freeze((d->>'id')::uuid,(d->>'lease_token')::uuid,jsonb_build_object('text','different'))=frozen,'retry cannot rewrite payload');
+ -- A later committed result enters a later window and cannot rewrite the sealed payload.
+ effect=jsonb_build_object('work_id',w->'id','lease_token',w->'lease_token','expected_version',w->'version','idempotency_key',gen_random_uuid(),'operation','jobs.upsert','input',jsonb_build_object('id',job->'id','expected_version',job->'version','salary_text','USD 333 after seal','idempotency_key',gen_random_uuid()));
+ r=public.crm_operation('automation.commit',effect);perform pg_temp.expect(not(r ? 'error'),'late result committed');
+ perform pg_temp.expect((select count(distinct batch_id)=2 from public.automation_events where job_id=(job->>'id')::uuid),'late result belongs to a later batch');
+ perform pg_temp.expect((select content::text not like '%USD 333 after seal%' and request_body=frozen from crm_private.automation_emails where id=(d->>'id')::uuid),'sealed membership and bytes unchanged');
+ r=public.crm_operation('notifications.preferences','{}');perform public.crm_operation('notifications.configure',jsonb_build_object('expected_version',r->'version','live_email',true,'disclosure','generic','idempotency_key',gen_random_uuid()));
+ perform pg_temp.expect(not crm_private.automation_email_authorize((d->>'id')::uuid,(d->>'lease_token')::uuid),'disclosure revocation cancels further detailed attempts');
+ perform crm_private.automation_email_finish((d->>'id')::uuid,(d->>'lease_token')::uuid,-1,null);
+ perform pg_temp.expect((select state='cancelled' from crm_private.automation_emails where id=(d->>'id')::uuid),'cancelled delivery retains receipt');
+ -- Opt-out and disclosure revocation also stop queued messages before their first attempt.
+ insert into crm_private.automation_emails(user_id,window_key,kind,recipient,counts,disclosure,content,legacy) values(auth.uid(),'fixture/updates','updates','owner@example.invalid','{}','generic','{}',false),(auth.uid(),'fixture/detail','updates','owner@example.invalid','{}','vacancy_summary','{}',false);
+ r=public.crm_operation('notifications.preferences','{}');perform public.crm_operation('notifications.configure',jsonb_build_object('expected_version',r->'version','live_email',false,'disclosure','generic','idempotency_key',gen_random_uuid()));
+ perform crm_private.automation_email_claim_v2();
+ perform pg_temp.expect((select bool_and(state='cancelled' and attempts=0 and request_body is null) from crm_private.automation_emails where window_key in ('fixture/updates','fixture/detail')),'opt-out cancels unattempted messages');
+ delete from public.contacts where user_id=auth.uid();
+ perform pg_temp.expect((select count(*)=1 from public.automation_events where kind='contacts'),'contact deletion preserves only the safe historical count');
+ update public.automation_events set created_at=now()-interval '91 days';perform crm_private.notification_prune();
+ perform pg_temp.expect((select bool_and(snapshot is null) from public.automation_events),'old detail minimized without removing event');
+ perform pg_temp.expect(extract(epoch from ((crm_private.notification_day_window('2026-03-09T14:00:00Z','America/New_York')->>'end')::timestamptz-(crm_private.notification_day_window('2026-03-09T14:00:00Z','America/New_York')->>'start')::timestamptz))=23*3600,'spring daily window follows owner timezone');
+ perform pg_temp.expect(extract(epoch from ((crm_private.notification_day_window('2026-11-02T14:00:00Z','America/New_York')->>'end')::timestamptz-(crm_private.notification_day_window('2026-11-02T14:00:00Z','America/New_York')->>'start')::timestamptz))=25*3600,'fall daily window follows owner timezone');
+end $$;
+-- Owner RLS and public operation denial both apply to a different authenticated identity.
+select set_config('request.jwt.claims','{"sub":"00000000-0000-4000-8000-000000000002","session_id":"00000000-0000-4000-8000-000000000020","role":"authenticated","aud":"authenticated"}',false);
+set local role authenticated;
+do $$ begin
+ perform pg_temp.expect((select count(*)=0 from public.notification_batches),'other identity sees no history');
+ perform pg_temp.expect(public.crm_operation('notifications.list','{}')->'error'->>'code'='FORBIDDEN','other identity operation denied');
+end $$;
+reset role;
+rollback;

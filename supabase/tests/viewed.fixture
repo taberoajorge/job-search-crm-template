@@ -1,0 +1,22 @@
+\set ON_ERROR_STOP on
+begin;
+delete from crm_private.settings;
+insert into auth.users(id,email) values('00000000-0000-4000-8000-000000000009','viewed@example.invalid');
+insert into auth.sessions(id,user_id) values('00000000-0000-4000-8000-000000000090','00000000-0000-4000-8000-000000000009');
+insert into crm_private.settings(owner_id,mcp_resource) values('00000000-0000-4000-8000-000000000009','https://example.invalid/functions/v1/mcp');
+select set_config('request.jwt.claims','{"sub":"00000000-0000-4000-8000-000000000009","session_id":"00000000-0000-4000-8000-000000000090","role":"authenticated"}',false);
+create or replace function pg_temp.expect(value boolean,label text) returns void language plpgsql as $$begin if value is distinct from true then raise exception 'FAILED: %',label;end if;end$$;
+do $$
+declare c jsonb;j jsonb;r jsonb;
+begin
+ c=public.crm_operation('companies.upsert',jsonb_build_object('name','Viewed fixture','idempotency_key',gen_random_uuid()));
+ j=public.crm_operation('jobs.upsert',jsonb_build_object('company_id',c->'id','title','Historical view','viewed',true,'idempotency_key',gen_random_uuid()));
+ perform pg_temp.expect(j->>'viewed'='true' and j ? 'viewed_at' and j->>'viewed_at' is null,'Historical boolean must not invent time');
+ r=public.crm_operation('jobs.upsert',jsonb_build_object('id',j->'id','expected_version',j->'version','viewed','true','idempotency_key',gen_random_uuid()));
+ perform pg_temp.expect(r->'error'->>'code'='VALIDATION_ERROR','Viewed string must fail');
+ r=public.crm_operation('jobs.upsert',jsonb_build_object('id',j->'id','expected_version',j->'version','viewed',null,'idempotency_key',gen_random_uuid()));
+ perform pg_temp.expect(r->'error'->>'code'='VALIDATION_ERROR','Viewed null must fail');
+ j=public.crm_operation('jobs.upsert',jsonb_build_object('company_id',c->'id','title','Timestamp view','viewed_at','2026-10-03T00:00:00Z','idempotency_key',gen_random_uuid()));
+ perform pg_temp.expect(j->>'viewed'='true' and j->>'viewed_at' is not null,'Actual timestamp implies viewed');
+end $$;
+rollback;

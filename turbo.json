@@ -1,0 +1,19 @@
+{
+  "$schema": "./node_modules/turbo/schema.json",
+  "agentGuidance": false,
+  "tasks": {},
+  "boundaries": {
+    "tags": {
+      "contracts": {
+        "dependencies": {
+          "allow": []
+        }
+      },
+      "web": {
+        "dependencies": {
+          "allow": ["contracts"]
+        }
+      }
+    }
+  }
+}

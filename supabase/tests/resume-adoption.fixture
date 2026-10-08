@@ -1,0 +1,45 @@
+\set ON_ERROR_STOP on
+begin;
+delete from crm_private.settings;
+insert into auth.users(id,email) values('00000000-0000-4000-8000-000000000005','adoption@example.invalid'),('00000000-0000-4000-8000-000000000006','foreign-adoption@example.invalid');
+insert into auth.sessions(id,user_id) values('00000000-0000-4000-8000-000000000050','00000000-0000-4000-8000-000000000005');
+insert into crm_private.settings(owner_id,mcp_resource) values('00000000-0000-4000-8000-000000000005','https://example.invalid/functions/v1/mcp');
+select set_config('request.jwt.claims','{"sub":"00000000-0000-4000-8000-000000000005","session_id":"00000000-0000-4000-8000-000000000050","role":"authenticated"}',false);
+create or replace function pg_temp.expect(value boolean,label text) returns void language plpgsql as $$begin if value is distinct from true then raise exception 'FAILED: %',label; end if; end$$;
+
+do $$
+declare owner uuid='00000000-0000-4000-8000-000000000005'; original jsonb; data jsonb; payload jsonb; task jsonb; lease jsonb; result jsonb; before_receipts bigint; foreign_id uuid; bad jsonb;
+begin
+ insert into storage.objects(bucket_id,name) values('resumes',owner::text||'/finalized/resume.pdf');
+ data=jsonb_build_object('label','Original CV','country','Mexico','track','AI','storage_path',owner::text||'/finalized/resume.pdf','checksum',repeat('a',64),'media_type','application/pdf','active',true);
+ result=public.crm_operation('resumes.finalize',data||jsonb_build_object('idempotency_key',gen_random_uuid()));
+ perform pg_temp.expect(result->>'version'='1','pre-finalized CV fixture');
+ select to_jsonb(r) into original from public.resumes r where id=(result->>'id')::uuid;
+ data=data||jsonb_build_object('id',result->'id');
+ payload=jsonb_build_object('import_namespace','resume-adoption','records',jsonb_build_array(jsonb_build_object('entity_type','resumes','legacy_id','CVs/original.pdf','data',data)));
+ task=public.crm_operation('tasks.submit',jsonb_build_object('kind','bulk_import','payload',payload,'idempotency_key',gen_random_uuid()));
+ lease=crm_private.worker_claim();
+ result=crm_private.worker_import((lease->>'id')::uuid,(lease->>'lease_token')::uuid);
+ perform pg_temp.expect(result->'records'->0->'id'=original->'id' and result->'records'->0->>'version'='1','adoption retains finalized identity/version');
+ perform pg_temp.expect((select to_jsonb(r)=original from public.resumes r where id=(original->>'id')::uuid),'adoption does not update metadata or bytes');
+ perform pg_temp.expect((select count(*)=1 from public.legacy_links where user_id=owner and import_namespace='resume-adoption') and (select count(*)=1 from public.audit_events where user_id=owner and action='import.resumes.adopt'),'adoption binding and audit');
+ perform pg_temp.expect((select count(*)=1 and bool_and(not(response ? 'storage_path')) from public.mutation_receipts where user_id=owner and operation='import.resumes'),'adoption receipt excludes private path');
+ task=public.crm_operation('tasks.submit',jsonb_build_object('kind','bulk_import','payload',payload,'idempotency_key',gen_random_uuid()));
+ lease=crm_private.worker_claim();
+ perform crm_private.worker_import((lease->>'id')::uuid,(lease->>'lease_token')::uuid);
+ perform pg_temp.expect((select count(*)=1 from public.legacy_links where user_id=owner and import_namespace='resume-adoption') and (select count(*)=1 from public.audit_events where user_id=owner and action='import.resumes.adopt') and (select count(*)=1 from public.mutation_receipts where user_id=owner and operation='import.resumes'),'replay preserves binding/audit/child receipt counts');
+ for bad in select value from jsonb_array_elements(jsonb_build_array(data||'{"label":"Changed CV"}'::jsonb,data||jsonb_build_object('checksum',repeat('b',64)))) loop
+  task=public.crm_operation('tasks.submit',jsonb_build_object('kind','bulk_import','payload',jsonb_build_object('import_namespace',gen_random_uuid()::text,'records',jsonb_build_array(jsonb_build_object('entity_type','resumes','legacy_id','mismatch','data',bad))),'idempotency_key',gen_random_uuid()));
+  lease=crm_private.worker_claim();select count(*) into before_receipts from public.mutation_receipts;
+  begin perform crm_private.worker_import((lease->>'id')::uuid,(lease->>'lease_token')::uuid);raise exception 'Expected metadata conflict';exception when sqlstate 'CR001' then perform pg_temp.expect(SQLERRM::jsonb->>'code'='CONFLICT','metadata mismatch returns CONFLICT');end;
+  perform pg_temp.expect((select to_jsonb(r)=original from public.resumes r where id=(original->>'id')::uuid) and (select count(*)=before_receipts from public.mutation_receipts) and (select count(*)=1 from public.legacy_links where user_id=owner),'conflict rolls back adoption and preserves CV');
+  perform crm_private.worker_finish((lease->>'id')::uuid,(lease->>'lease_token')::uuid,null,'{"code":"CONFLICT","message":"Metadata mismatch","retryable":false}');
+ end loop;
+ foreign_id=gen_random_uuid();
+ insert into public.resumes(id,user_id,label,storage_path,checksum,media_type) values(foreign_id,'00000000-0000-4000-8000-000000000006','Foreign CV','00000000-0000-4000-8000-000000000006/resume.pdf',repeat('c',64),'application/pdf');
+ task=public.crm_operation('tasks.submit',jsonb_build_object('kind','bulk_import','payload',jsonb_build_object('import_namespace','cross-owner','records',jsonb_build_array(jsonb_build_object('entity_type','resumes','legacy_id','foreign','data',data||jsonb_build_object('id',foreign_id)))),'idempotency_key',gen_random_uuid()));
+ lease=crm_private.worker_claim();select count(*) into before_receipts from public.mutation_receipts;
+ begin perform crm_private.worker_import((lease->>'id')::uuid,(lease->>'lease_token')::uuid);raise exception 'Expected cross-owner rejection';exception when sqlstate 'CR001' then perform pg_temp.expect(SQLERRM::jsonb->>'code'='FORBIDDEN','cross-owner adoption denied');end;
+ perform pg_temp.expect((select count(*)=before_receipts from public.mutation_receipts) and (select count(*)=1 from public.legacy_links where user_id=owner),'cross-owner failure creates no adoption receipts/bindings');
+end $$;
+rollback;

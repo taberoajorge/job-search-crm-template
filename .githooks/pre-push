@@ -1,0 +1,9 @@
+#!/bin/sh
+set -eu
+cd "$(git rev-parse --show-toplevel)"
+if [ -f .node-version ] && [ "$(node -p 'process.versions.node.split(".")[0]')" != "$(cut -d. -f1 .node-version)" ]; then
+  echo "Use the Node major pinned in .node-version before pushing." >&2
+  exit 1
+fi
+corepack pnpm check
+corepack pnpm build

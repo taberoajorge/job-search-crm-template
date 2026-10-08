@@ -1,0 +1,122 @@
+\set ON_ERROR_STOP on
+begin;
+delete from crm_private.settings;
+insert into auth.users(id,email)values('00000000-0000-4000-8000-000000000051','filters@example.invalid'),('00000000-0000-4000-8000-000000000052','foreign-filters@example.invalid');
+insert into auth.sessions(id,user_id)values('00000000-0000-4000-8000-000000000053','00000000-0000-4000-8000-000000000051');
+insert into crm_private.settings(owner_id,mcp_resource)values('00000000-0000-4000-8000-000000000051','https://example.invalid/functions/v1/mcp');
+select set_config('request.jwt.claims','{"sub":"00000000-0000-4000-8000-000000000051","session_id":"00000000-0000-4000-8000-000000000053","role":"authenticated"}',false);
+create function pg_temp.expect(value boolean,label text)returns void language plpgsql as $$begin if value is distinct from true then raise exception 'FAILED: %',label; end if; end$$;
+do $$
+declare owner uuid='00000000-0000-4000-8000-000000000051'; company uuid; other_company uuid; r jsonb; cur text; bad jsonb; ids jsonb; ordering text; actual jsonb; expected jsonb; search_query text; operation text;
+begin
+ insert into public.companies(user_id,name)values(owner,'Filter fixtures')returning id into company;
+ insert into public.companies(user_id,name)values('00000000-0000-4000-8000-000000000052','Foreign fixtures')returning id into other_company;
+ insert into public.jobs(user_id,company_id,title,location,salary_text,salary_min,salary_max,currency,created_at)values
+ (owner,company,'Unknown legacy pay','Lima','$100k/yr',null,null,null,'2026-01-01T00:00:00Z'),
+ (owner,company,'Closed USD range','MX_%\literal','Explicit range',100,200,'USD','2026-01-02T00:00:00Z'),
+ (owner,company,'Lower USD bound','México','Explicit minimum',300,null,'USD','2026-01-03T00:00:00Z'),
+ (owner,company,'Upper USD bound','México','Explicit maximum',null,80,'USD','2026-01-04T00:00:00Z'),
+ (owner,company,'Low USD range','México','Explicit low range',10,20,'USD','2026-01-05T00:00:00Z'),
+ (owner,company,'Closed EUR range','México','Explicit EUR',100,200,'EUR','2026-01-06T00:00:00Z');
+ insert into public.jobs(user_id,company_id,title,location,salary_min,salary_max,currency)values('00000000-0000-4000-8000-000000000052',other_company,'Foreign range','MX_%\literal',100,200,'USD');
+ r=public.crm_operation('jobs.list','{"limit":50}');perform pg_temp.expect(jsonb_array_length(r->'items')=6,'all owner rows only');
+ r=public.crm_operation('jobs.list','{"salary_known":false}');perform pg_temp.expect(jsonb_array_length(r->'items')=1 and r->'items'->0->>'title'='Unknown legacy pay','unknown numeric salary retains raw text');
+ r=public.crm_operation('jobs.list','{"salary_known":true}');perform pg_temp.expect(jsonb_array_length(r->'items')=5,'any explicit numeric bound is known');
+ r=public.crm_operation('jobs.list','{"salary_min":150,"salary_max":350,"currency":"USD"}');perform pg_temp.expect(jsonb_array_length(r->'items')=2,'range overlap and lower partial bound without currency conversion');
+ r=public.crm_operation('jobs.list','{"salary_min":30,"salary_max":50,"currency":"USD"}');perform pg_temp.expect(jsonb_array_length(r->'items')=1 and r->'items'->0->>'title'='Upper USD bound','upper partial range overlaps');
+ r=public.crm_operation('jobs.list','{"salary_min":200,"salary_max":200,"currency":"USD"}');perform pg_temp.expect(jsonb_array_length(r->'items')=1 and r->'items'->0->>'title'='Closed USD range','touching endpoint included');
+ r=public.crm_operation('jobs.list','{"currency":"EUR"}');perform pg_temp.expect(jsonb_array_length(r->'items')=1,'exact structured currency');
+ r=public.crm_operation('jobs.list',jsonb_build_object('location_query','mx_%\literal','limit',1));perform pg_temp.expect(jsonb_array_length(r->'items')=1 and r->'items'->0->>'title'='Closed USD range' and r->>'has_more'='false','literal percent underscore backslash with case-insensitive match before pagination');
+ r=public.crm_operation('jobs.list','{"location_query":"%"}');perform pg_temp.expect(jsonb_array_length(r->'items')=1,'percent is not wildcard');
+ r=public.crm_operation('jobs.list','{"location_query":"_"}');perform pg_temp.expect(jsonb_array_length(r->'items')=1,'underscore is not wildcard');
+ r=public.crm_operation('jobs.list','{"location_query":"méxico","limit":2}');cur=r->>'next_cursor';perform pg_temp.expect(jsonb_array_length(r->'items')=2 and cur is not null,'filter before bounded cursor page');ids=jsonb_build_array(r->'items'->0->'id',r->'items'->1->'id');
+ r=public.crm_operation('jobs.list',jsonb_build_object('location_query','méxico','limit',2,'cursor',cur));perform pg_temp.expect(jsonb_array_length(r->'items')=2 and r->>'has_more'='false' and not ids @> jsonb_build_array(r->'items'->0->'id') and not ids @> jsonb_build_array(r->'items'->1->'id'),'second filtered page no duplicates');
+ r=public.crm_operation('jobs.list',jsonb_build_object('location_query','Lima','cursor',cur));perform pg_temp.expect(r->'error'->>'code'='VALIDATION_ERROR','location changes invalidate cursor');
+ r=public.crm_operation('jobs.list',jsonb_build_object('location_query','méxico','salary_known',true,'cursor',cur));perform pg_temp.expect(r->'error'->>'code'='VALIDATION_ERROR','salary changes invalidate cursor');
+ r=public.crm_operation('jobs.list',jsonb_build_object('location_query','%'' OR true --'));perform pg_temp.expect(jsonb_array_length(r->'items')=0,'location cannot inject predicate');
+ foreach bad in array array['{"salary_min":1}'::jsonb,'{"salary_max":1}'::jsonb,'{"salary_min":20,"salary_max":10,"currency":"USD"}'::jsonb,'{"salary_min":-1,"currency":"USD"}'::jsonb,'{"salary_min":"100","currency":"USD"}'::jsonb,'{"currency":"usd"}'::jsonb,'{"salary_known":false,"salary_min":0,"currency":"USD"}'::jsonb,'{"salary_known":false,"salary_max":0,"currency":"USD"}'::jsonb,'{"salary_known":"false"}'::jsonb,'{"salary_known":null}'::jsonb,'{"location_query":null}'::jsonb,'{"country":"MX"}'::jsonb,'{"company_id":null}'::jsonb,'{"limit":51}'::jsonb,'{"limit":100000000000000000000000000000000001}'::jsonb,'{"limit":"bad"}'::jsonb]loop
+  r=public.crm_operation('jobs.list',bad);perform pg_temp.expect(r->'error'->>'code'='VALIDATION_ERROR','strict invalid filter '||bad::text);
+ end loop;
+ foreach bad in array array['{"created_at":"2026-02-30T00:00:00Z"}'::jsonb,'{"created_at":"2026-01-01T00:00:00+99:00"}'::jsonb,'{"created_at":"infinity"}'::jsonb,'{"created_at":null}'::jsonb,'{"id":"invalid-uuid"}'::jsonb,'{"id":null}'::jsonb]loop
+  r=public.crm_operation('jobs.list',jsonb_build_object('location_query','méxico','cursor',encode(convert_to(((convert_from(decode(cur,'base64'),'UTF8')::jsonb)||bad)::text,'UTF8'),'base64')));
+  perform pg_temp.expect(r->'error'->>'code'='VALIDATION_ERROR' and r->'error'->>'field'='cursor','malformed cursor remains filter validation');
+ end loop;
+ r=public.crm_operation('jobs.list',jsonb_build_object('location_query',repeat('x',501)));perform pg_temp.expect(r->'error'->>'code'='VALIDATION_ERROR','location bounded length');
+ r=public.crm_operation('jobs.list','{"stage":"radar","query":"Closed"}');perform pg_temp.expect(jsonb_array_length(r->'items')=2,'existing text and stage filters retained');
+ update public.jobs set posted_on=case title when 'Unknown legacy pay' then '2026-01-06'::date when 'Closed USD range' then '2026-01-06'::date when 'Lower USD bound' then '2025-12-01'::date else null end where user_id=owner;
+ insert into public.jobs(user_id,company_id,title,created_at,posted_on)values(owner,company,'Tied addition','2026-01-06T00:00:00Z',null);
+ foreach ordering in array array['created_desc','posted_desc'] loop
+  actual='[]'::jsonb; cur=null;
+  loop
+   r=public.crm_operation('jobs.list',jsonb_build_object('sort',ordering,'limit',2)||case when cur is null then '{}'::jsonb else jsonb_build_object('cursor',cur) end);
+   perform pg_temp.expect(not r ? 'error','valid ordered page');
+   select actual||coalesce(jsonb_agg(value->'id' order by ordinality),'[]') into actual from jsonb_array_elements(r->'items') with ordinality;
+   cur=r->>'next_cursor'; exit when cur is null;
+  end loop;
+  if ordering='created_desc' then select jsonb_agg(id order by created_at desc,id desc) into expected from public.jobs where user_id=owner;
+  else select jsonb_agg(id order by posted_on desc nulls last,id desc) into expected from public.jobs where user_id=owner; end if;
+  perform pg_temp.expect(actual=expected,'all ordered pages including ties and nulls '||ordering);
+ end loop;
+ r=public.crm_operation('jobs.list','{"sort":"created_desc","added_from":"2026-01-02T00:00:00Z","added_before":"2026-01-03T00:00:00Z"}');
+ perform pg_temp.expect(jsonb_array_length(r->'items')=1 and r->'items'->0->>'title'='Closed USD range','inclusive start exclusive end');
+ r=public.crm_operation('jobs.list','{"sort":"posted_desc","posted_from":"2026-01-06","posted_to":"2026-01-06"}');
+ perform pg_temp.expect(jsonb_array_length(r->'items')=2,'inclusive publication days exclude unknown dates');
+ r=public.crm_operation('jobs.list','{"sort":"posted_desc","limit":1}');cur=r->>'next_cursor';
+ r=public.crm_operation('jobs.list',jsonb_build_object('sort','created_desc','cursor',cur));perform pg_temp.expect(r->'error'->>'code'='VALIDATION_ERROR','sort scope rejection');
+ r=public.crm_operation('jobs.list',jsonb_build_object('sort','posted_desc','posted_from','2026-01-01','cursor',cur));perform pg_temp.expect(r->'error'->>'code'='VALIDATION_ERROR','date scope rejection');
+ r=public.crm_operation('jobs.list',jsonb_build_object('sort','posted_desc','cursor',encode(convert_to((convert_from(decode(cur,'base64'),'UTF8')::jsonb||'{"posted_on":"2026-02-30"}'::jsonb)::text,'UTF8'),'base64')));
+ perform pg_temp.expect(r->'error'->>'field'='cursor','malformed publication cursor');
+ foreach bad in array array['{"sort":"updated_desc"}'::jsonb,'{"sort":null}'::jsonb,'{"added_from":"infinity"}'::jsonb,'{"added_before":"2026-02-30T00:00:00Z"}'::jsonb,'{"posted_from":"2026-02-30"}'::jsonb,'{"posted_to":null}'::jsonb,'{"posted_from":"2026-01-02","posted_to":"2026-01-01"}'::jsonb,'{"added_from":"2026-01-02T00:00:00Z","added_before":"2026-01-02T00:00:00Z"}'::jsonb]loop
+  r=public.crm_operation('jobs.list',bad);perform pg_temp.expect(r->'error'->>'code'='VALIDATION_ERROR','invalid recency '||bad::text);
+ end loop;
+ -- The same partial/typo semantics apply to companies and linked job/contact company names.
+ insert into public.companies(user_id,name)values(owner,'Example Company Labs');
+ update public.companies set name='Example Company' where id=company;
+ update public.companies set name='Example Company foreign' where id=other_company;
+ insert into public.contacts(user_id,company_id,name,role,draft_message)values(owner,company,'Alice Recruiter','Talent Acquisition','Preserve this unsent draft'),(owner,company,'Bob Recruiter','Hiring','Another saved draft');
+ insert into public.contacts(user_id,company_id,name)values('00000000-0000-4000-8000-000000000052',other_company,'Foreign recruiter');
+ foreach operation in array array['companies.list','contacts.search','jobs.list'] loop
+  foreach search_query in array array['Smart','sma','bar','  SMART  ','smrat','barr sma',E'sma\tbar'] loop
+   r=public.crm_operation(operation,jsonb_build_object('query',search_query,'limit',50));
+   perform pg_temp.expect(jsonb_array_length(r->'items')=case operation when 'jobs.list' then 7 else 2 end,'partial/typo company search '||operation||' '||search_query);
+   perform pg_temp.expect(not exists(select 1 from jsonb_array_elements(r->'items') item where item->>'user_id'<>owner::text),'search cannot expose foreign owner');
+  end loop;
+  foreach search_query in array array['zzzzzz','Smart zzzzzz','%','_',E'\\',E'\' OR true --'] loop
+   r=public.crm_operation(operation,jsonb_build_object('query',search_query));
+   perform pg_temp.expect(jsonb_array_length(r->'items')=0,'literal/all-term negative query '||operation||' '||search_query);
+  end loop;
+ end loop;
+ r=public.crm_operation('contacts.search','{"query":"ali acqu"}');perform pg_temp.expect(jsonb_array_length(r->'items')=1 and r->'items'->0->>'draft_message'='Preserve this unsent draft','name and role fragments preserve actual draft');
+ r=public.crm_operation('jobs.list','{"query":"sma","salary_known":true,"currency":"EUR"}');perform pg_temp.expect(jsonb_array_length(r->'items')=1,'partial query composes with exact salary/currency');
+ r=public.crm_operation('jobs.list','{"query":"sma","stage":"offer"}');perform pg_temp.expect(jsonb_array_length(r->'items')=0,'status remains exact');
+ foreach operation in array array['companies.list','contacts.search','jobs.list'] loop
+  actual='[]'::jsonb; cur=null;
+  loop
+   r=public.crm_operation(operation,jsonb_build_object('query','sma','limit',1)||case when cur is null then '{}'::jsonb else jsonb_build_object('cursor',cur) end);
+   perform pg_temp.expect(not r ? 'error','partial filtered cursor');
+   perform pg_temp.expect(not actual @> jsonb_build_array(r->'items'->0->'id'),'partial pages do not repeat IDs');
+   actual=actual||jsonb_build_array(r->'items'->0->'id');
+   cur=r->>'next_cursor'; exit when cur is null;
+   bad=public.crm_operation(operation,jsonb_build_object('query','sma','cursor',encode(convert_to((convert_from(decode(cur,'base64'),'UTF8')::jsonb||jsonb_build_object('scope',md5(owner::text||split_part(operation,'.',1)||'{"query":"sma"}'::jsonb::text)))::text,'UTF8'),'base64')));
+   perform pg_temp.expect(bad->'error'->>'code'='VALIDATION_ERROR','pre-change queried cursor rejected');
+   bad=public.crm_operation(operation,jsonb_build_object('query','zzzzzz','cursor',cur));perform pg_temp.expect(bad->'error'->>'code'='VALIDATION_ERROR','query changes invalidate cursor');
+  end loop;
+  perform pg_temp.expect(jsonb_array_length(actual)=case operation when 'jobs.list' then 7 else 2 end,'all partial matches traverse pages');
+ end loop;
+ r=public.crm_operation('contacts.search',jsonb_build_object('query','sma','company_id',other_company));perform pg_temp.expect(jsonb_array_length(r->'items')=0,'company ID remains exact and owner-scoped');
+ r=public.crm_operation('jobs.list','{"query":"clo eur"}');perform pg_temp.expect(jsonb_array_length(r->'items')=1 and r->'items'->0->>'title'='Closed EUR range','all job title fragments');
+ update public.jobs set notes='Unique pineapple evidence' where user_id=owner and title='Closed EUR range';
+ r=public.crm_operation('jobs.list','{"query":"pineap"}');perform pg_temp.expect(jsonb_array_length(r->'items')=1,'job notes remain searchable');
+ perform pg_temp.expect(crm_private.text_matches('Literal %_\\ value','%_\\') and not crm_private.text_matches('Literal value','%_\\'),'literal punctuation positive and negative');
+ perform pg_temp.expect(not crm_private.text_matches('Very maintainable AI platform','vera ai','Platform Engineer Example Company'),'typo tolerance ignores long notes');
+ perform pg_temp.expect(crm_private.text_matches('Notes only','smrat','Platform Engineer Example Company'),'typo tolerance uses the identity');
+ perform pg_temp.expect(crm_private.text_matches('Senior AI engineer','ai') and not crm_private.text_matches('Maintain email','ai'),'short terms match word starts');
+ perform pg_temp.expect(not has_function_privilege('authenticated','crm_private.text_matches(text,text,text)','EXECUTE') and not has_function_privilege('anon','crm_private.text_matches(text,text,text)','EXECUTE'),'private search helper grants');
+ perform pg_temp.expect(not has_function_privilege('authenticated','crm_private.jobs_page(uuid,jsonb)','EXECUTE')and not has_function_privilege('anon','crm_private.jobs_page(uuid,jsonb)','EXECUTE'),'private page narrow grants');
+ perform set_config('request.jwt.claims','{"sub":"00000000-0000-4000-8000-000000000052","role":"authenticated"}',false);r=public.crm_operation('jobs.list','{}');perform pg_temp.expect(r->'error'->>'code'='FORBIDDEN','foreign owner denied');
+ perform set_config('request.jwt.claims','{"sub":"00000000-0000-4000-8000-000000000051","session_id":"00000000-0000-4000-8000-000000000053","role":"authenticated"}',false);delete from auth.sessions where id='00000000-0000-4000-8000-000000000053';r=public.crm_operation('jobs.list','{}');perform pg_temp.expect(r->'error'->>'code'='UNAUTHENTICATED','revoked session denied');
+ foreach operation in array array['companies.list','contacts.search','jobs.list'] loop
+  r=public.crm_operation(operation,'{"query":"sma"}');perform pg_temp.expect(r->'error'->>'code'='UNAUTHENTICATED','revoked partial search denied '||operation);
+ end loop;
+end $$;
+rollback;

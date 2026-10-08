@@ -1,0 +1,61 @@
+{
+  "$schema": "./node_modules/oxlint/configuration_schema.json",
+  // Listing plugins replaces oxlint's defaults, so oxc and unicorn are named explicitly.
+  "plugins": ["typescript", "react", "oxc", "unicorn"],
+  "categories": {
+    "correctness": "error"
+  },
+  // agent-experience/code-strictness: no explicit any or non-null assertions; hooks follow the rules of hooks.
+  "rules": {
+    "typescript/no-explicit-any": "error",
+    "typescript/no-non-null-assertion": "error",
+    "react/rules-of-hooks": "error"
+  },
+  "overrides": [
+    {
+      // Suppression scope: files with violations when this ratchet landed (openspec-019).
+      // Reason: owners burn these down; remove a file from this list once it complies. New files must comply.
+      "files": [
+        "apps/web/src/screens/Automation.tsx",
+        "apps/web/src/screens/JobDetail.tsx",
+        "apps/web/src/screens/Settings.tsx",
+        "apps/web/src/shared/state/crm.tsx",
+        "apps/web/src/shared/ui/CompanyGuide.tsx",
+        "apps/web/src/shared/ui/JevClassification.tsx",
+        "apps/web/src/shared/ui/controls.tsx",
+        "apps/web/src/shared/ui/interview-time.ts",
+        "apps/web/src/shared/ui/notifications.tsx",
+        "apps/web/tests/notifications.test.tsx",
+        "apps/web/tests/reconcile.test.tsx",
+        "apps/web/tests/remediation.test.tsx",
+        "apps/web/tests/resource-layout.test.tsx",
+        "apps/web/tests/sw.test.ts",
+        "packages/contracts/src/backup.test.ts",
+        "packages/contracts/src/contact-privacy.test.ts",
+        "packages/contracts/src/domain.test.ts",
+        "packages/contracts/src/mcp-conformance.test.ts",
+        "packages/contracts/src/mcp/catalog.ts",
+        "packages/contracts/src/mcp/output.ts",
+        "packages/contracts/src/sql-parity.test.ts",
+        "supabase/functions/mcp/index.ts",
+        "supabase/tests/automation-output-schema.test.ts",
+        "supabase/tests/edge.test.ts",
+        "supabase/tests/http.test.ts"
+      ],
+      "rules": {
+        "typescript/no-explicit-any": "off",
+        "typescript/no-non-null-assertion": "off"
+      }
+    },
+    {
+      // Pre-existing unicorn findings in other teams' files; remove each once fixed.
+      "files": ["apps/web/public/sw.js", "apps/web/tests/resource-layout.test.tsx"],
+      "rules": {
+        "unicorn/no-useless-fallback-in-spread": "off",
+        "unicorn/no-useless-spread": "off",
+        "unicorn/prefer-string-starts-ends-with": "off"
+      }
+    }
+  ],
+  "ignorePatterns": ["index.html", "openspec/**", ".agents/**", "node_modules/**", "**/dist/**"]
+}

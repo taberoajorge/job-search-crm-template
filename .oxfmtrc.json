@@ -1,0 +1,12 @@
+{
+  "ignorePatterns": [
+    "index.html",
+    "openspec/**",
+    ".agents/**",
+    "pnpm-lock.yaml",
+    "node_modules/**",
+    "**/dist/**",
+    "artifacts/**",
+    "packages/contracts/src/database.ts"
+  ]
+}

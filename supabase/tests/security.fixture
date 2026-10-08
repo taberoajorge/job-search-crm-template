@@ -1,0 +1,93 @@
+\set ON_ERROR_STOP on
+begin;
+delete from crm_private.settings;
+insert into auth.users(id,email) values('00000000-0000-4000-8000-000000000001','owner@example.invalid'),('00000000-0000-4000-8000-000000000002','other@example.invalid');
+insert into auth.sessions(id,user_id) values('00000000-0000-4000-8000-000000000010','00000000-0000-4000-8000-000000000001'),('00000000-0000-4000-8000-000000000020','00000000-0000-4000-8000-000000000002');
+insert into crm_private.settings(owner_id,mcp_resource) values('00000000-0000-4000-8000-000000000001','https://example.invalid/functions/v1/mcp');
+select set_config('request.jwt.claims','{"sub":"00000000-0000-4000-8000-000000000001","session_id":"00000000-0000-4000-8000-000000000010","role":"authenticated","aud":"authenticated"}',false);
+create function pg_temp.expect(value boolean,label text) returns void language plpgsql as $$ begin if value is distinct from true then raise exception 'FAILED: %',label; end if; end $$;
+
+do $$
+declare company jsonb; job jsonb; contact jsonb; r jsonb; original jsonb; v bigint; audits bigint; receipt_count bigint; bad uuid; lease jsonb; d jsonb; task jsonb;
+begin
+ company=public.crm_operation('companies.upsert','{"name":"Alpha","idempotency_key":"10000000-0000-4000-8000-000000000001"}');
+ perform pg_temp.expect(company->>'name'='Alpha','company create');
+ job=public.crm_operation('jobs.upsert',jsonb_build_object('company_id',company->'id','title','Engineer','idempotency_key','10000000-0000-4000-8000-000000000002'));
+ perform pg_temp.expect(job->>'stage'='radar' and jsonb_array_length(job->'duplicate_hints')=0,'job create');
+ perform pg_temp.expect(crm_private.normalized_url('HTTPS://EXAMPLE.com/Posting/1?id=ABC&utm_source=feed#section')='https://example.com/Posting/1?id=ABC#section','URL hints preserve meaningful identifiers');
+ r=public.crm_operation('jobs.transition',jsonb_build_object('id',job->'id','expected_version',1,'stage','applied','idempotency_key','10000000-0000-4000-8000-000000000003'));
+ perform pg_temp.expect(r->'error'->>'code'='VALIDATION_ERROR','application requires date');
+ r=public.crm_operation('jobs.transition',jsonb_build_object('id',job->'id','expected_version',1,'stage','applied','applied_at','2026-10-01T12:00:00Z','idempotency_key','10000000-0000-4000-8000-000000000004'));
+ perform pg_temp.expect(r->'job'->>'stage'='applied','application transition');
+ original=r; select count(*) into audits from public.audit_events;
+ r=public.crm_operation('jobs.transition',jsonb_build_object('id',job->'id','expected_version',1,'stage','applied','applied_at','2026-10-01T12:00:00Z','idempotency_key','10000000-0000-4000-8000-000000000004'));
+ perform pg_temp.expect(r=original and (select count(*) from public.audit_events)=audits,'retry before version check');
+ r=public.crm_operation('jobs.transition',jsonb_build_object('id',job->'id','expected_version',1,'stage','replied','idempotency_key','10000000-0000-4000-8000-000000000004'));
+ perform pg_temp.expect(r->'error'->>'code'='IDEMPOTENCY_CONFLICT','different retry payload');
+ r=public.crm_operation('jobs.transition',jsonb_build_object('id',job->'id','expected_version',1,'stage','replied','idempotency_key','10000000-0000-4000-8000-000000000005'));
+ perform pg_temp.expect(r->'error'->>'code'='CONFLICT' and r->'error'->>'current_version'='2','stale write conflict');
+ contact=public.crm_operation('contacts.upsert',jsonb_build_object('company_id',company->'id','job_id',job->'id','name','Recruiter','status','replied','idempotency_key','10000000-0000-4000-8000-000000000006'));
+ perform pg_temp.expect(contact->'changed_jobs'->0->>'stage'='replied','contact advances active job');
+ perform pg_temp.expect((select applied_at is not null from public.jobs where id=(job->>'id')::uuid),'contact preserves applied date');
+ r=public.crm_operation('jobs.transition',jsonb_build_object('id',job->'id','expected_version',3,'stage','radar','idempotency_key','10000000-0000-4000-8000-000000000007'));
+ perform pg_temp.expect(r->'error'->>'code'='VALIDATION_ERROR','backwards reason');
+ r=public.crm_operation('contacts.upsert',jsonb_build_object('company_id',company->'id','name','Too long','draft_note',repeat('x',301),'idempotency_key','10000000-0000-4000-8000-000000000008'));
+ perform pg_temp.expect(r->'error'->>'code'='VALIDATION_ERROR','draft limit');
+ r=public.crm_operation('jobs.upsert',jsonb_build_object('company_id',company->'id','title','Bad stage','stage','interviewing','idempotency_key','10000000-0000-4000-8000-000000000009'));
+ perform pg_temp.expect(r->'error'->>'code'='VALIDATION_ERROR','canonical enum');
+ r=public.crm_operation('companies.upsert','{"name":"Unsafe","website_url":"javascript:alert(1)","idempotency_key":"10000000-0000-4000-8000-000000000010"}');
+ perform pg_temp.expect(r->'error'->>'code'='VALIDATION_ERROR','safe URL');
+ r=public.crm_operation('companies.upsert','{"name":"Forged","user_id":"00000000-0000-4000-8000-000000000002","idempotency_key":"10000000-0000-4000-8000-000000000011"}');
+ perform pg_temp.expect(r->'error'->>'code'='VALIDATION_ERROR','unknown owner input');
+ insert into public.companies(user_id,name) values('00000000-0000-4000-8000-000000000002','Other') returning id into bad;
+ r=public.crm_operation('jobs.upsert',jsonb_build_object('company_id',bad,'title','Cross owner','idempotency_key','10000000-0000-4000-8000-000000000012'));
+ perform pg_temp.expect(r->'error'->>'code'='VALIDATION_ERROR','same owner FK');
+ r=public.crm_operation('interviews.upsert',jsonb_build_object('job_id',job->'id','state','planned','timezone','Not/AZone','idempotency_key','10000000-0000-4000-8000-000000000013'));
+ perform pg_temp.expect(r->'error'->>'code'='VALIDATION_ERROR','IANA timezone');
+ r=public.crm_operation('companies.list','{"limit":1}');
+ perform pg_temp.expect(jsonb_array_length(r->'items')=1 and r->>'has_more'='false','RLS owner page');
+ r=public.crm_operation('jobs.list','{"query":"Enginer"}');
+ perform pg_temp.expect(jsonb_array_length(r->'items')=1,'typo tolerant search');
+ r=public.crm_operation('companies.archive',jsonb_build_object('id',company->'id','expected_version',1,'reason','Test','idempotency_key','10000000-0000-4000-8000-000000000014'));
+ perform pg_temp.expect(r->'error'->>'code'='VALIDATION_ERROR','cascade confirmation');
+ task=public.crm_operation('tasks.submit','{"kind":"bulk_import","payload":{"import_namespace":"tests","records":[{"entity_type":"companies","legacy_id":"legacy-1","data":{"id":"10000000-0000-4000-8000-000000000099","name":"Imported"}}]},"idempotency_key":"10000000-0000-4000-8000-000000000015"}');
+ perform pg_temp.expect(task->>'state'='queued','bounded normalized task');
+ lease=crm_private.worker_claim();
+ perform pg_temp.expect(lease->>'id'=task->>'task_id','worker claims');
+ begin perform crm_private.worker_import((lease->>'id')::uuid,gen_random_uuid()); raise exception 'Expected forbidden'; exception when sqlstate 'CR001' then perform pg_temp.expect(SQLERRM::jsonb->>'code'='FORBIDDEN','forged lease'); end;
+ r=crm_private.worker_import((lease->>'id')::uuid,(lease->>'lease_token')::uuid);
+ perform pg_temp.expect((select count(*)=1 from public.legacy_links where legacy_id='legacy-1'),'import links');
+ perform pg_temp.expect((select state='completed' from public.crm_jobs where id=(lease->>'id')::uuid),'durable task completion');
+ task=public.crm_operation('tasks.submit','{"kind":"bulk_import","payload":{"import_namespace":"tests","records":[{"entity_type":"companies","legacy_id":"legacy-1","data":{"id":"10000000-0000-4000-8000-000000000099","name":"Imported"}}]},"idempotency_key":"10000000-0000-4000-8000-000000000016"}');
+ lease=crm_private.worker_claim(); r=crm_private.worker_import((lease->>'id')::uuid,(lease->>'lease_token')::uuid);
+ perform pg_temp.expect((select count(*)=1 from public.companies where name='Imported'),'repeatable import');
+ perform pg_temp.expect(not has_table_privilege('authenticated','public.jobs','INSERT,UPDATE,DELETE'),'no direct mutation grants');
+ perform pg_temp.expect(not has_function_privilege('anon','public.crm_operation(text,jsonb)','EXECUTE'),'anonymous RPC denied');
+ perform pg_temp.expect(not has_table_privilege('crm_worker','public.jobs','SELECT,INSERT,UPDATE,DELETE'),'worker no arbitrary tables');
+ perform pg_temp.expect(not (select rolbypassrls from pg_roles where rolname='crm_worker'),'worker no bypass RLS');
+ perform pg_temp.expect(not has_function_privilege('authenticated','crm_private.worker_claim()','EXECUTE'),'user cannot claim queue');
+end $$;
+
+-- Exercise actual RLS as other authenticated subject, then owner.
+set local role authenticated;
+select set_config('request.jwt.claims','{"sub":"00000000-0000-4000-8000-000000000002","session_id":"00000000-0000-4000-8000-000000000020","role":"authenticated"}',true);
+select pg_temp.expect((select count(*)=0 from public.jobs),'other subject RLS');
+select pg_temp.expect(public.crm_operation('jobs.list','{}')->'error'->>'code'='FORBIDDEN','other subject RPC');
+select set_config('request.jwt.claims','{"sub":"00000000-0000-4000-8000-000000000001","session_id":"00000000-0000-4000-8000-000000000010","role":"authenticated"}',true);
+select pg_temp.expect((select count(*)=1 from public.jobs),'owner reads');
+reset role;
+
+-- Audit failure must roll back write AND receipt.
+create function pg_temp.fail_audit() returns trigger language plpgsql as $$begin raise exception 'Injected audit failure'; end$$;
+create trigger test_audit_failure before insert on public.audit_events for each row execute function pg_temp.fail_audit();
+select pg_temp.expect(public.crm_operation('companies.upsert','{"name":"Must rollback","idempotency_key":"10000000-0000-4000-8000-000000000088"}')->'error'->>'code'='TEMPORARY_FAILURE','audit error envelope');
+select pg_temp.expect((select count(*)=0 from public.companies where name='Must rollback'),'audit rollback business');
+select pg_temp.expect((select count(*)=0 from public.mutation_receipts where idempotency_key='10000000-0000-4000-8000-000000000088'),'audit rollback receipt');
+drop trigger test_audit_failure on public.audit_events;
+-- Revoked sessions deny RPC and RLS immediately.
+delete from auth.sessions where id='00000000-0000-4000-8000-000000000010';
+select pg_temp.expect(public.crm_operation('jobs.list','{}')->'error'->>'code'='UNAUTHENTICATED','revoked session');
+set local role authenticated;
+select pg_temp.expect((select count(*)=0 from public.jobs),'revoked RLS');
+reset role;
+rollback;

@@ -1,0 +1,13 @@
+packages:
+  - apps/*
+  - packages/*
+onlyBuiltDependencies:
+  - esbuild
+# Supply-chain guards (pnpm 10.33): resolve only versions published at least
+# 3 days ago (7 days rejects versions already in the lockfile), refuse
+# provenance downgrades and non-registry transitive sources, and fail (not
+# warn) on new unreviewed install scripts.
+minimumReleaseAge: 4320
+trustPolicy: no-downgrade
+blockExoticSubdeps: true
+strictDepBuilds: true

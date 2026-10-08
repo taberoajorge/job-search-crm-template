@@ -1,0 +1,20 @@
+{
+  "name": "@crm/contracts",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./mcp": "./src/mcp/index.ts",
+    "./database": "./src/database.ts",
+    "./domain": "./src/domain.ts",
+    "./mcp/catalog": "./src/mcp/catalog.ts"
+  },
+  "dependencies": {
+    "zod": "4.3.6"
+  },
+  "devDependencies": {
+    "ajv": "8.20.0",
+    "ajv-formats": "3.0.1"
+  }
+}

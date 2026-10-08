@@ -1,0 +1,44 @@
+{
+  "name": "job-search-crm-template",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tsx scripts/local.ts dev",
+    "build": "pnpm --filter @crm/web build",
+    "format": "oxfmt .",
+    "check": "oxfmt --check . && oxlint . && pnpm typecheck && pnpm test",
+    "typecheck": "tsc -p packages/contracts/tsconfig.json && tsc -p packages/contracts/tsconfig.test.json && tsc -p scripts/tsconfig.json && pnpm --filter @crm/web check",
+    "test": "tsx --test 'packages/contracts/src/**/*.test.ts' && pnpm --filter @crm/web test",
+    "check:edge": "deno check --frozen --config supabase/functions/deno.json supabase/functions/mcp/index.ts supabase/functions/crm/index.ts",
+    "db:start": "tsx scripts/local.ts start",
+    "db:reset": "tsx scripts/local.ts reset",
+    "db:test": "tsx scripts/local.ts test",
+    "db:stop": "tsx scripts/local.ts stop",
+    "db:types": "tsx scripts/local.ts types",
+    "local:info": "tsx scripts/local.ts info",
+    "test:edge": "tsx scripts/local.ts edge-test",
+    "init": "tsx scripts/init.ts"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.32.1",
+    "@supabase/supabase-js": "2.117.2",
+    "zod": "4.3.6"
+  },
+  "devDependencies": {
+    "@commitlint/cli": "21.2.3",
+    "@commitlint/config-conventional": "21.2.3",
+    "@playwright/test": "1.63.0",
+    "@types/node": "22.19.15",
+    "oxfmt": "0.71.0",
+    "oxlint": "1.86.0",
+    "supabase": "2.119.0",
+    "tsx": "4.23.15",
+    "turbo": "2.11.7",
+    "typescript": "7.0.2",
+    "typescript-api": "npm:typescript@5.9.3"
+  },
+  "engines": {
+    "node": "22.x"
+  },
+  "packageManager": "pnpm@10.33.0"
+}

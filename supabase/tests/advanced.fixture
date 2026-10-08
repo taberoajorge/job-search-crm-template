@@ -1,0 +1,111 @@
+\set ON_ERROR_STOP on
+begin;
+delete from crm_private.settings;
+insert into auth.users(id,email) values('00000000-0000-4000-8000-000000000003','advanced@example.invalid'),('00000000-0000-4000-8000-000000000004','foreign@example.invalid');
+insert into auth.sessions(id,user_id) values('00000000-0000-4000-8000-000000000030','00000000-0000-4000-8000-000000000003');
+insert into crm_private.settings(owner_id,mcp_resource) values('00000000-0000-4000-8000-000000000003','https://example.invalid/functions/v1/mcp');
+select set_config('request.jwt.claims','{"sub":"00000000-0000-4000-8000-000000000003","session_id":"00000000-0000-4000-8000-000000000030","role":"authenticated"}',false);
+create function pg_temp.expect(value boolean,label text) returns void language plpgsql as $$begin if value is distinct from true then raise exception 'FAILED: %',label; end if; end$$;
+
+do $$
+declare source jsonb; target jsonb; j jsonb; c jsonb; o jsonb; r jsonb; task jsonb; lease jsonb; push jsonb; foreign_contact uuid; aid uuid; b jsonb; cursor text; before_count bigint; owner uuid='00000000-0000-4000-8000-000000000003';
+begin
+ source=public.crm_operation('companies.upsert',jsonb_build_object('name','Source','idempotency_key',gen_random_uuid()));
+ target=public.crm_operation('companies.upsert',jsonb_build_object('name','Target','idempotency_key',gen_random_uuid()));
+ j=public.crm_operation('jobs.upsert',jsonb_build_object('company_id',source->'id','title','Candidate','stage','applied','applied_at','2026-10-01T00:00:00Z','idempotency_key',gen_random_uuid()));
+ c=public.crm_operation('contacts.upsert',jsonb_build_object('company_id',source->'id','job_id',j->'id','name','Person','idempotency_key',gen_random_uuid()));
+ o=public.crm_operation('outreach.draft',jsonb_build_object('contact_id',c->'contact'->'id','job_id',j->'id','body','Hello','channel','email','kind','message','idempotency_key',gen_random_uuid()));
+ r=public.crm_operation('outreach.queue',jsonb_build_object('id',o->'id','expected_version',1,'scheduled_for','2099-01-01T00:00:00Z','idempotency_key',gen_random_uuid()));
+ perform pg_temp.expect(r->>'state'='queued','outreach queue');
+ r=public.crm_operation('verifications.record',jsonb_build_object('company_id',source->'id','status','confirmed','checked_at','2026-10-01T00:00:00Z','notes','','idempotency_key',gen_random_uuid()));
+ perform pg_temp.expect(r->>'status'='confirmed','verification append');
+ r=public.crm_operation('companies.list','{"limit":1}'); cursor=r->>'next_cursor';
+ perform pg_temp.expect(cursor is not null,'next cursor');
+ r=public.crm_operation('companies.list',jsonb_build_object('limit',1,'query','changed','cursor',cursor));
+ perform pg_temp.expect(r->'error'->>'code'='VALIDATION_ERROR','cursor bound to filters');
+ r=public.crm_operation('companies.merge',jsonb_build_object('source_id',source->'id','source_version',2,'target_id',target->'id','target_version',1,'reason','Duplicate','confirmation',true,'idempotency_key',gen_random_uuid()));
+ perform pg_temp.expect(r->'error'->>'code'='CONFLICT','merge both versions');
+ r=public.crm_operation('companies.merge',jsonb_build_object('source_id',source->'id','source_version',1,'target_id',target->'id','target_version',1,'reason','Duplicate','confirmation',true,'idempotency_key',gen_random_uuid()));
+ perform pg_temp.expect(r->>'id'=target->>'id' and r->>'version'='2','merge survives target and versions');
+ perform pg_temp.expect((select company_id=(target->>'id')::uuid from public.jobs where id=(j->>'id')::uuid),'merge job reassigned');
+ perform pg_temp.expect((select count(*)=2 from public.verifications where user_id=owner),'merge verification provenance retained');
+ r=public.crm_operation('companies.archive',jsonb_build_object('id',target->'id','expected_version',2,'reason','Archive','confirmation',true,'idempotency_key',gen_random_uuid()));
+ perform pg_temp.expect(r->'affected'->>'jobs'='1' and r->'affected'->>'outreach'='1','archive affected counts');
+ perform pg_temp.expect((select state='cancelled' from public.outreach_events where id=(o->>'id')::uuid),'archive cancels future outreach');
+ r=public.crm_operation('contacts.upsert',jsonb_build_object('id',c->'contact'->'id','expected_version',3,'status','replied','idempotency_key',gen_random_uuid()));
+ perform pg_temp.expect(jsonb_array_length(r->'changed_jobs')=0 and (select stage='archived' from public.jobs where id=(j->>'id')::uuid),'contact never reopens terminal job');
+ r=public.crm_operation('jobs.transition',jsonb_build_object('id',j->'id','expected_version',3,'stage','ready','idempotency_key',gen_random_uuid()));
+ perform pg_temp.expect(r->'error'->>'code'='VALIDATION_ERROR','terminal reopening reason');
+ r=public.crm_operation('dashboard.summary','{"from":"2026-09-01T00:00:00Z","to":"2026-10-02T00:00:00Z"}');
+ perform pg_temp.expect(r->>'dated_applications'='1','dated metrics include archived application');
+
+ b=public.crm_operation('companies.upsert',jsonb_build_object('name','Application company','idempotency_key',gen_random_uuid()));
+ b=public.crm_operation('jobs.upsert',jsonb_build_object('company_id',b->'id','title','Explicit application','idempotency_key',gen_random_uuid()));
+ r=public.crm_operation('contacts.upsert',jsonb_build_object('company_id',b->'company_id','job_id',b->'id','name','Early reply','status','replied','idempotency_key',gen_random_uuid()));
+ perform pg_temp.expect(jsonb_array_length(r->'changed_jobs')=0 and (select applied_at is null and stage='radar' from public.jobs where id=(b->>'id')::uuid),'contact cannot manufacture application');
+ r=public.crm_operation('outreach.draft',jsonb_build_object('job_id',b->'id','body','','channel','manual','kind','application','idempotency_key',gen_random_uuid()));
+ r=public.crm_operation('outreach.mark_sent',jsonb_build_object('id',r->'id','expected_version',1,'occurred_at','2026-10-01T00:00:00Z','confirmation_ref','Manually submitted','idempotency_key',gen_random_uuid()));
+ perform pg_temp.expect(r->>'state'='sent' and (select stage='applied' and applied_at is not null from public.jobs where id=(b->>'id')::uuid),'attested application and job evidence commit together');
+ insert into public.contacts(user_id,company_id,name) values(owner,(target->>'id')::uuid,'Owned interviewer') returning id into aid;
+ insert into public.companies(user_id,name) values('00000000-0000-4000-8000-000000000004','Foreign') returning id into foreign_contact;
+ insert into public.contacts(user_id,company_id,name) values('00000000-0000-4000-8000-000000000004',foreign_contact,'Foreign') returning id into foreign_contact;
+ r=public.crm_operation('interviews.upsert',jsonb_build_object('job_id',j->'id','state','planned','timezone','UTC','interviewer_ids',jsonb_build_array(foreign_contact),'idempotency_key',gen_random_uuid()));
+ perform pg_temp.expect(r->'error'->>'code'='VALIDATION_ERROR','interviewer same-owner array');
+ task=public.crm_operation('tasks.submit',jsonb_build_object('kind','embed_records','payload',jsonb_build_object('records',jsonb_build_array(jsonb_build_object('entity_type','jobs','id',j->'id'))),'idempotency_key',gen_random_uuid()));
+ lease=crm_private.worker_claim();
+ perform pg_temp.expect((lease->>'lease_until')::timestamptz-now()=interval '60 seconds','exact 60 second lease');
+ perform pg_temp.expect(crm_private.worker_renew((lease->>'id')::uuid,(lease->>'lease_token')::uuid)>now(),'lease renewal');
+ begin perform crm_private.worker_renew((lease->>'id')::uuid,gen_random_uuid()); raise exception 'Expected forbidden'; exception when sqlstate 'CR001' then perform pg_temp.expect(SQLERRM::jsonb->>'code'='FORBIDDEN','forged renewal'); end;
+ update public.crm_jobs set lease_until=now()-interval '1 second' where id=(lease->>'id')::uuid;
+ begin perform crm_private.worker_renew((lease->>'id')::uuid,(lease->>'lease_token')::uuid); raise exception 'Expected forbidden'; exception when sqlstate 'CR001' then perform pg_temp.expect(SQLERRM::jsonb->>'code'='FORBIDDEN','expired lease cannot resurrect'); end;
+ b=crm_private.worker_claim(); perform pg_temp.expect(b->>'attempts'='2' and b->>'lease_token'<>lease->>'lease_token','expired job reclaim rotates lease');
+ r=crm_private.worker_records((b->>'id')::uuid,(b->>'lease_token')::uuid);
+ perform crm_private.worker_embeddings((b->>'id')::uuid,(b->>'lease_token')::uuid,jsonb_build_array(jsonb_build_object('entity_type','jobs','id',j->'id','version',r->0->'version','vector',jsonb_build_array(1,0))),'test-model');
+ r=public.crm_operation('search.semantic','{"entity_type":"jobs","embedding":[1,0],"model":"test-model"}');
+ perform pg_temp.expect(jsonb_array_length(r->'items')=1 and r->'items'->0->>'score'='1','semantic owned result');
+ r=public.crm_operation('search.semantic','{"entity_type":"jobs","embedding":[1,0],"model":"other-model"}');
+ perform pg_temp.expect(jsonb_array_length(r->'items')=0,'embedding model isolation');
+ r=public.crm_operation('push.subscribe',jsonb_build_object('endpoint','https://fcm.googleapis.com/test','p256dh',repeat('A',87),'auth',repeat('B',22),'idempotency_key',gen_random_uuid()));
+ perform pg_temp.expect(r->>'active'='true','push subscribe');
+ task=public.crm_operation('tasks.submit',jsonb_build_object('kind','embed_records','payload',jsonb_build_object('records',jsonb_build_array(jsonb_build_object('entity_type','jobs','id',j->'id'))),'idempotency_key',gen_random_uuid()));
+ lease=crm_private.worker_claim();
+ perform crm_private.worker_finish((lease->>'id')::uuid,(lease->>'lease_token')::uuid,'{"done":true}');
+ push=crm_private.push_claim(); perform pg_temp.expect(push is not null,'durable push delivery');
+ perform crm_private.push_finish((push->>'id')::uuid,(push->>'lease_token')::uuid,503);
+ update public.push_deliveries set next_attempt_at=now(); push=crm_private.push_claim();
+ perform crm_private.push_finish((push->>'id')::uuid,(push->>'lease_token')::uuid,503);
+ update public.push_deliveries set next_attempt_at=now(); push=crm_private.push_claim();
+ perform crm_private.push_finish((push->>'id')::uuid,(push->>'lease_token')::uuid,503);
+ perform pg_temp.expect((select state='failed' and attempts=3 from public.push_deliveries where id=(push->>'id')::uuid),'push at most three attempts');
+ update public.push_deliveries set state='queued',attempts=0,next_attempt_at=now(); push=crm_private.push_claim();
+ perform crm_private.push_finish((push->>'id')::uuid,(push->>'lease_token')::uuid,410);
+ perform pg_temp.expect((select not active from public.push_subscriptions where id=(r->>'id')::uuid),'410 subscription deactivation');
+
+ task=public.crm_operation('tasks.submit',jsonb_build_object('kind','embed_records','payload',jsonb_build_object('records',jsonb_build_array(jsonb_build_object('entity_type','jobs','id',j->'id'))),'idempotency_key',gen_random_uuid()));
+ lease=crm_private.worker_claim();
+ perform crm_private.worker_finish((lease->>'id')::uuid,(lease->>'lease_token')::uuid,null,'{"code":"TEMPORARY_FAILURE","message":"network","retryable":true}');
+ perform pg_temp.expect((select state='queued' and next_attempt_at-now()=interval '5 seconds' from public.crm_jobs where id=(lease->>'id')::uuid),'first retry exactly five seconds');
+ update public.crm_jobs set next_attempt_at=now() where id=(lease->>'id')::uuid; lease=crm_private.worker_claim();
+ perform crm_private.worker_finish((lease->>'id')::uuid,(lease->>'lease_token')::uuid,null,'{"code":"TEMPORARY_FAILURE","message":"network","retryable":true}');
+ perform pg_temp.expect((select state='queued' and next_attempt_at-now()=interval '30 seconds' from public.crm_jobs where id=(lease->>'id')::uuid),'second retry exactly thirty seconds');
+ update public.crm_jobs set next_attempt_at=now() where id=(lease->>'id')::uuid; lease=crm_private.worker_claim();
+ perform crm_private.worker_finish((lease->>'id')::uuid,(lease->>'lease_token')::uuid,null,'{"code":"TEMPORARY_FAILURE","message":"network","retryable":true}');
+ perform pg_temp.expect((select state='failed' and attempts=3 from public.crm_jobs where id=(lease->>'id')::uuid),'task stops after third attempt');
+ task=public.crm_operation('tasks.submit',jsonb_build_object('kind','bulk_import','payload',jsonb_build_object('import_namespace','atomic','records',jsonb_build_array(jsonb_build_object('entity_type','companies','legacy_id','rollback-company','data',jsonb_build_object('id',gen_random_uuid(),'name','Atomic rollback')),jsonb_build_object('entity_type','jobs','legacy_id','invalid-job','data',jsonb_build_object('id',gen_random_uuid(),'company_id','ffffffff-ffff-4fff-8fff-ffffffffffff','title','Invalid reference')))),'idempotency_key',gen_random_uuid()));
+ lease=crm_private.worker_claim(); select count(*) into before_count from public.mutation_receipts;
+ begin perform crm_private.worker_import((lease->>'id')::uuid,(lease->>'lease_token')::uuid); raise exception 'Expected FK failure'; exception when foreign_key_violation then null; end;
+ perform pg_temp.expect((select count(*)=0 from public.companies where name='Atomic rollback') and (select count(*)=before_count from public.mutation_receipts),'entire batch and child receipts roll back');
+ perform crm_private.worker_finish((lease->>'id')::uuid,(lease->>'lease_token')::uuid,null,'{"code":"VALIDATION_ERROR","message":"invalid batch","retryable":false}');
+ perform pg_temp.expect((select state='failed' and attempts=1 from public.crm_jobs where id=(lease->>'id')::uuid),'permanent error never retries');
+ r=public.crm_operation('push.subscribe',jsonb_build_object('endpoint','https://127.0.0.1/private','p256dh',repeat('A',87),'auth',repeat('B',22),'idempotency_key',gen_random_uuid()));
+ perform pg_temp.expect(r->'error'->>'code'='VALIDATION_ERROR','push SSRF rejected');
+end $$;
+rollback;
+
+\ir resume-adoption.fixture
+
+\ir email.fixture
+
+\ir viewed.fixture
+
+\ir audit-retention.fixture

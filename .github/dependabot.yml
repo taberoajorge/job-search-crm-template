@@ -1,0 +1,27 @@
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    # Conventional prefix keeps Dependabot commits valid under commitlint and the delivery policy.
+    commit-message:
+      prefix: chore(deps)
+    cooldown:
+      default-days: 7
+    groups:
+      actions:
+        patterns: ["*"]
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+    # Conventional prefix keeps Dependabot commits valid under commitlint and the delivery policy.
+    commit-message:
+      prefix: chore(deps)
+    cooldown:
+      default-days: 7
+    open-pull-requests-limit: 5
+    groups:
+      minor-and-patch:
+        update-types: [minor, patch]

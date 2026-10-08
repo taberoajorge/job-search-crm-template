@@ -1,0 +1,59 @@
+project_id = "job-search-crm-v2"
+[api]
+enabled = true
+port = 54321
+schemas = ["public"]
+extra_search_path = ["public", "extensions"]
+max_rows = 100
+[db]
+port = 54322
+shadow_port = 54320
+major_version = 17
+[db.migrations]
+enabled = true
+schema_paths = []
+[db.seed]
+enabled = false
+[realtime]
+enabled = true
+[studio]
+enabled = true
+port = 54323
+[inbucket]
+enabled = true
+port = 54324
+[storage]
+enabled = true
+file_size_limit = "10MiB"
+[auth]
+enabled = true
+site_url = "http://localhost:5173"
+additional_redirect_urls = [
+  "http://localhost:5173/auth/callback",
+  "http://localhost:5173/oauth/consent**",
+]
+jwt_expiry = 900
+enable_signup = false
+enable_anonymous_sign_ins = false
+enable_refresh_token_rotation = true
+[auth.email]
+# Keep account creation closed until the installer enables the chosen Auth flow.
+enable_signup = false
+enable_confirmations = true
+[auth.oauth_server]
+enabled = false
+authorization_url_path = "/oauth/consent"
+allow_dynamic_registration = false
+[edge_runtime]
+enabled = true
+policy = "per_worker"
+deno_version = 2
+[functions.mcp]
+verify_jwt = false
+[functions.crm]
+verify_jwt = false
+
+
+[auth.hook.custom_access_token]
+enabled = true
+uri = "pg-functions://postgres/crm_private/access_token_hook"
